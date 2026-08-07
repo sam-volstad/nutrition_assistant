@@ -1,0 +1,116 @@
+import math
+
+import pandas as pd
+
+
+class NutritionEngine:
+    def __init__(self, food_repository):
+        self.food_repository = food_repository
+
+    def calculate_food_nutrients(self, fdc_id, grams):
+        if not math.isfinite(grams) or grams <= 0:
+            raise ValueError("grams must be a positive finite number")
+
+        nutrients = self.food_repository.get_nutrients(fdc_id).copy()
+
+        if nutrients.empty:
+            raise ValueError(f"No nutrient data found for fdc_id {fdc_id}")
+
+        # Missing USDA nutrient rows mean not reported/available, not zero.
+        nutrients["amount_consumed"] = (
+            nutrients["amount"] * grams / 100.0
+        )
+
+        return nutrients
+
+    def calculate_portion_nutrients(
+        self,
+        fdc_id,
+        quantity=1,
+        portion_id=None
+    ):
+        if not math.isfinite(quantity) or quantity <= 0:
+            raise ValueError("quantity must be a positive finite number")
+
+        portions = self.food_repository.get_portions(fdc_id)
+
+        if portions.empty:
+            raise ValueError(
+                f"No portion information found for fdc_id {fdc_id}"
+            )
+
+        if portion_id is not None:
+            matching = portions[
+                portions["portion_id"] == portion_id
+            ]
+
+            if matching.empty:
+                raise ValueError(
+                    f"Portion {portion_id} not found for fdc_id {fdc_id}"
+                )
+
+            portion = matching.iloc[0]
+
+            if not self._has_usable_gram_weight(portion):
+                raise ValueError(
+                    f"Portion {portion_id} has an invalid gram weight"
+                )
+
+        else:
+            usable = portions[
+                portions.apply(self._has_usable_gram_weight, axis=1)
+            ]
+
+            if usable.empty:
+                raise ValueError(
+                    f"No portion with a valid gram weight found for fdc_id {fdc_id}"
+                )
+
+            if len(usable) > 1:
+                raise ValueError(
+                    f"Multiple portions found for fdc_id {fdc_id}; "
+                    "provide a portion_id"
+                )
+
+            portion = usable.iloc[0]
+
+        grams = portion["gram_weight"] * quantity
+
+        return self.calculate_food_nutrients(
+            fdc_id=fdc_id,
+            grams=grams
+        )
+
+    def calculate_meal(self, meal):
+        if not meal.ingredients:
+            raise ValueError("Meal contains no ingredients")
+
+        results = []
+
+        for ingredient in meal.ingredients:
+            nutrients = self.calculate_food_nutrients(
+                ingredient.fdc_id,
+                ingredient.grams
+            )
+
+            results.append(nutrients)
+
+        meal_totals = (
+            pd.concat(results)
+            .groupby(
+                ["nutrient_id", "name", "unit_name"],
+                as_index=False
+            )["amount_consumed"]
+            .sum()
+        )
+
+        return meal_totals
+
+    @staticmethod
+    def _has_usable_gram_weight(portion):
+        gram_weight = portion["gram_weight"]
+        return (
+            pd.notna(gram_weight)
+            and math.isfinite(gram_weight)
+            and gram_weight > 0
+        )
