@@ -114,3 +114,74 @@ class NutritionEngine:
             and math.isfinite(gram_weight)
             and gram_weight > 0
         )
+
+    def score_against_targets(self, nutrients, targets):
+        scored = targets.merge(
+            nutrients[
+                ["nutrient_id", "amount_consumed"]
+            ],
+            on="nutrient_id",
+            how="left"
+        )
+
+        # Missing USDA nutrient rows stay missing, not zero.
+        scored["reported"] = scored["amount_consumed"].notna()
+
+        scored["target_progress"] = (
+            scored["amount_consumed"]
+            / scored["target_amount"]
+        )
+
+        scored["minimum_progress"] = (
+            scored["amount_consumed"]
+            / scored["minimum_amount"]
+        )
+
+        scored["maximum_progress"] = (
+            scored["amount_consumed"]
+            / scored["maximum_amount"]
+        )
+
+        scored["remaining_to_target"] = (
+            scored["target_amount"]
+            - scored["amount_consumed"]
+        ).clip(lower=0)
+
+        return scored
+
+
+    def calculate_day(self, meals):
+        if not meals:
+            raise ValueError("Day contains no meals")
+
+        results = []
+
+        for meal in meals:
+            meal_nutrients = self.calculate_meal(meal)
+            results.append(meal_nutrients)
+
+        day_totals = (
+            pd.concat(results)
+            .groupby(
+                ["nutrient_id", "name", "unit_name"],
+                as_index=False
+            )["amount_consumed"]
+            .sum()
+        )
+
+        return day_totals
+
+
+    def summarize_score(self, score):
+        columns = [
+            "name",
+            "unit_name",
+            "amount_consumed",
+            "target_amount",
+            "maximum_amount",
+            "target_progress",
+            "remaining_to_target",
+            "reported"
+        ]
+
+        return score[columns]
