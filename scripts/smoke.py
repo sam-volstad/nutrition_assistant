@@ -15,10 +15,33 @@ def main() -> None:
 
     try:
         meal_row = food_repository.con.execute(
-            "SELECT meal_id FROM meals ORDER BY meal_id LIMIT 1"
+            """
+            SELECT m.meal_id
+            FROM meals m
+            WHERE EXISTS (
+                SELECT 1
+                FROM meal_ingredients mi
+                WHERE mi.meal_id = m.meal_id
+            )
+            AND NOT EXISTS (
+                SELECT 1
+                FROM meal_ingredients mi
+                WHERE mi.meal_id = m.meal_id
+                AND NOT EXISTS (
+                    SELECT 1
+                    FROM food_nutrient fn
+                    WHERE fn.fdc_id = mi.fdc_id
+                )
+            )
+            ORDER BY m.meal_id
+            LIMIT 1
+            """
         ).fetchone()
         if meal_row is None:
-            raise RuntimeError("No saved meal is available for the smoke check")
+            raise RuntimeError(
+                "No saved meal with reported nutrient data is available "
+                "for the smoke check"
+            )
 
         meal = meal_repository.get_meal(meal_row[0])
         meal_nutrients = engine.calculate_meal(meal)

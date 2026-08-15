@@ -8,6 +8,10 @@ from nutrition_assistant.config import DATABASE_PATH
 from nutrition_assistant.engine.nutrition_engine import NutritionEngine
 from nutrition_assistant.models.ingredient import Ingredient
 from nutrition_assistant.models.meal import Meal
+from nutrition_assistant.planner.optimizer import (
+    rank_meals,
+    recommendation_explanation,
+)
 from nutrition_assistant.repositories.food_repository import FoodRepository
 from nutrition_assistant.repositories.meal_repository import MealRepository
 from nutrition_assistant.repositories.target_repository import TargetRepository
@@ -455,6 +459,58 @@ def render_today(meal_repository, target_repository, engine) -> None:
         hide_index=True,
         width="stretch",
     )
+
+    st.subheader("What should I eat next?")
+    st.caption(
+        "Prototype recommendations use reported nutrient data and are not "
+        "medical advice or a claim of an objectively optimal diet."
+    )
+    saved_meals = meal_repository.list_meals()
+    eligible_rows = saved_meals[~saved_meals["meal_id"].isin(meal_ids)]
+    if eligible_rows.empty:
+        st.info("No other saved meals are available to recommend.")
+        return
+
+    eligible_ids = []
+    eligible_meals = []
+    for row in eligible_rows.itertuples(index=False):
+        try:
+            candidate = meal_repository.get_meal(int(row.meal_id))
+        except ValueError as error:
+            st.warning(str(error))
+            continue
+        eligible_ids.append(int(row.meal_id))
+        eligible_meals.append(candidate)
+
+    if not eligible_meals:
+        st.info("No eligible saved meals could be loaded.")
+        return
+
+    recommendations = rank_meals(
+        current_score=engine.score_against_targets(day_nutrients, targets),
+        meals=eligible_meals,
+        nutrition_engine=engine,
+        meal_ids=eligible_ids,
+    )
+    for rank, recommendation in enumerate(recommendations[:3], start=1):
+        benefit_text, warning_text = recommendation_explanation(recommendation)
+        with st.container(border=True):
+            st.markdown(f"**{rank}. {recommendation['meal_name']}**")
+            st.write(benefit_text)
+            if recommendation["upper_limit_warnings"]:
+                st.warning(f"⚠️ {warning_text}")
+            else:
+                st.write(f"✓ {warning_text}")
+            st.caption(
+                f"Score: {recommendation['score']:.3f} · "
+                f"Gaps helped: {recommendation['nutrients_helped']}"
+            )
+            if st.button(
+                "Add to Today",
+                key=f"add_recommendation_{recommendation['meal_id']}",
+            ):
+                st.session_state.today_meal_ids.append(recommendation["meal_id"])
+                st.rerun()
 
 
 def main() -> None:
