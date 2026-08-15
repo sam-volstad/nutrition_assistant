@@ -74,6 +74,7 @@ def initialize_database(
         _load_usda_tables(connection, raw_data_path)
         _create_views(connection)
         _create_application_schema(connection)
+        _refresh_food_quality(connection)
         connection.execute("COMMIT")
     except Exception:
         connection.execute("ROLLBACK")
@@ -262,4 +263,74 @@ def _seed_default_targets(connection) -> None:
         WHERE profile_name = 'default'
         """,
         DEFAULT_NUTRIENT_TARGETS,
+    )
+
+
+def _refresh_food_quality(connection) -> None:
+    """Rebuild lightweight source-record quality metadata from USDA tables."""
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS food_quality (
+            fdc_id BIGINT PRIMARY KEY,
+            reported_nutrient_count BIGINT NOT NULL,
+            has_nutrients BOOLEAN NOT NULL,
+            has_energy BOOLEAN NOT NULL,
+            has_protein BOOLEAN NOT NULL,
+            has_carbohydrate BOOLEAN NOT NULL,
+            has_fat BOOLEAN NOT NULL,
+            has_fiber BOOLEAN NOT NULL,
+            has_serving_or_portion BOOLEAN NOT NULL
+        )
+        """
+    )
+    connection.execute("DELETE FROM food_quality")
+    connection.execute(
+        """
+        INSERT INTO food_quality
+        WITH usable_nutrients AS (
+            SELECT
+                fdc_id,
+                nutrient_id
+            FROM food_nutrient
+            WHERE TRY_CAST(amount AS DOUBLE) IS NOT NULL
+              AND isfinite(TRY_CAST(amount AS DOUBLE))
+            GROUP BY fdc_id, nutrient_id
+        ),
+        nutrient_quality AS (
+            SELECT
+                fdc_id,
+                COUNT(*) AS reported_nutrient_count,
+                BOOL_OR(nutrient_id = 1008) AS has_energy,
+                BOOL_OR(nutrient_id = 1003) AS has_protein,
+                BOOL_OR(nutrient_id = 1005) AS has_carbohydrate,
+                BOOL_OR(nutrient_id = 1004) AS has_fat,
+                BOOL_OR(nutrient_id = 1079) AS has_fiber
+            FROM usable_nutrients
+            GROUP BY fdc_id
+        ),
+        portion_quality AS (
+            SELECT DISTINCT fdc_id
+            FROM food_portion
+            WHERE TRY_CAST(gram_weight AS DOUBLE) > 0
+              AND isfinite(TRY_CAST(gram_weight AS DOUBLE))
+            UNION
+            SELECT DISTINCT fdc_id
+            FROM branded_food
+            WHERE TRY_CAST(serving_size AS DOUBLE) > 0
+              AND isfinite(TRY_CAST(serving_size AS DOUBLE))
+        )
+        SELECT
+            f.fdc_id,
+            COALESCE(nq.reported_nutrient_count, 0),
+            COALESCE(nq.reported_nutrient_count, 0) > 0,
+            COALESCE(nq.has_energy, FALSE),
+            COALESCE(nq.has_protein, FALSE),
+            COALESCE(nq.has_carbohydrate, FALSE),
+            COALESCE(nq.has_fat, FALSE),
+            COALESCE(nq.has_fiber, FALSE),
+            pq.fdc_id IS NOT NULL
+        FROM food f
+        LEFT JOIN nutrient_quality nq USING (fdc_id)
+        LEFT JOIN portion_quality pq USING (fdc_id)
+        """
     )

@@ -14,28 +14,47 @@ class FoodRepository:
 
         self.con = duckdb.connect(str(db_path))
 
-    def search(self, search_term, limit=20):
+    def search(self, search_term, limit=20, include_incomplete=False):
         return self.con.execute("""
             WITH matches AS (
                 SELECT
-                    fdc_id,
-                    description,
-                    data_type,
-                    food_category_id,
-                    CASE data_type
+                    f.fdc_id,
+                    f.description,
+                    f.data_type,
+                    f.food_category_id,
+                    q.reported_nutrient_count,
+                    q.has_nutrients,
+                    q.has_energy,
+                    q.has_protein,
+                    q.has_carbohydrate,
+                    q.has_fat,
+                    q.has_fiber,
+                    q.has_serving_or_portion,
+                    CASE f.data_type
                         WHEN 'foundation_food' THEN 1
                         WHEN 'sr_legacy_food' THEN 2
                         WHEN 'survey_fndds_food' THEN 3
                         WHEN 'branded_food' THEN 4
                         ELSE 5
                     END AS data_type_rank
-                FROM food
-                WHERE lower(description) LIKE ?
+                FROM food f
+                JOIN food_quality q USING (fdc_id)
+                WHERE lower(f.description) LIKE ?
+                  AND (? OR q.has_nutrients)
                 ORDER BY
                     data_type_rank,
-                    length(description),
-                    description,
-                    fdc_id
+                    length(f.description),
+                    (
+                        CAST(q.has_energy AS INTEGER)
+                        + CAST(q.has_protein AS INTEGER)
+                        + CAST(q.has_carbohydrate AS INTEGER)
+                        + CAST(q.has_fat AS INTEGER)
+                        + CAST(q.has_fiber AS INTEGER)
+                    ) DESC,
+                    q.reported_nutrient_count DESC,
+                    q.has_serving_or_portion DESC,
+                    f.description,
+                    f.fdc_id
                 LIMIT ?
             ),
             branded_matches AS (
@@ -56,6 +75,14 @@ class FoodRepository:
                 f.data_type,
                 f.food_category_id,
                 fc.food_category,
+                f.reported_nutrient_count,
+                f.has_nutrients,
+                f.has_energy,
+                f.has_protein,
+                f.has_carbohydrate,
+                f.has_fat,
+                f.has_fiber,
+                f.has_serving_or_portion,
                 b.brand_name,
                 b.brand_owner,
                 b.household_serving_fulltext,
@@ -75,9 +102,26 @@ class FoodRepository:
             ORDER BY
                 f.data_type_rank,
                 length(f.description),
+                (
+                    CAST(f.has_energy AS INTEGER)
+                    + CAST(f.has_protein AS INTEGER)
+                    + CAST(f.has_carbohydrate AS INTEGER)
+                    + CAST(f.has_fat AS INTEGER)
+                    + CAST(f.has_fiber AS INTEGER)
+                ) DESC,
+                f.reported_nutrient_count DESC,
+                f.has_serving_or_portion DESC,
                 f.description,
                 f.fdc_id
-        """, [f"%{search_term.lower()}%", limit]).fetchdf()
+        """, [f"%{search_term.lower()}%", include_incomplete, limit]).fetchdf()
+
+    def get_food_quality(self, fdc_id):
+        quality = self.con.execute(
+            "SELECT * FROM food_quality WHERE fdc_id = ?", [fdc_id]
+        ).fetchdf()
+        if quality.empty:
+            raise ValueError(f"Unknown fdc_id: {fdc_id}")
+        return quality.iloc[0]
 
     def get_nutrients(self, fdc_id):
         return self.con.execute("""

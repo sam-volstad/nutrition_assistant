@@ -194,6 +194,10 @@ def food_details(food) -> dict:
         "Household serving": food.household_serving_fulltext,
         "Serving size": food.serving_size,
         "Serving size unit": food.serving_size_unit,
+        "Reported nutrients": getattr(food, "reported_nutrient_count", None),
+        "Portion data": (
+            "Yes" if getattr(food, "has_serving_or_portion", False) else "No"
+        ),
     }
     details.update(
         {
