@@ -1,15 +1,38 @@
+import re
+
 import pandas as pd
 
 
 ACCEPTABLE_PROGRESS = 0.90
 UPPER_LIMIT_PENALTY = 100.0
 NON_BENEFICIAL_TARGET_IDS = {1093}  # Sodium should not be rewarded as a gap.
+FOUNDATIONAL_NUTRIENT_IDS = {1008, 1003, 1079}  # Energy, protein, and fiber.
+FOUNDATIONAL_BENEFIT_MULTIPLIER = 2.0
 PREFERENCE_BONUSES = {
     "neutral": 0.0,
     "acceptable": 0.05,
     "preferred": 0.10,
 }
 EXCLUDED_PREFERENCES = {"avoid", "never"}
+MAX_FOOD_GAP_NUTRIENTS = 5
+FOOD_CANDIDATES_PER_NUTRIENT = 12
+MAX_FOOD_CANDIDATE_POOL = 40
+
+
+def foundational_gaps_remain(current_score) -> bool:
+    """Whether a reported foundational nutrient remains below 90% of target."""
+    foundational = current_score[
+        current_score["nutrient_id"].isin(FOUNDATIONAL_NUTRIENT_IDS)
+    ].copy()
+    foundational["reference_amount"] = foundational["target_amount"].combine_first(
+        foundational["minimum_amount"]
+    )
+    progress = foundational["amount_consumed"] / foundational["reference_amount"]
+    return bool((
+        foundational["reported"]
+        & foundational["reference_amount"].gt(0)
+        & progress.lt(ACCEPTABLE_PROGRESS)
+    ).any())
 
 
 def score_candidate_meal(current_score, candidate_nutrients):
@@ -68,7 +91,7 @@ def score_candidate_meal(current_score, candidate_nutrients):
         details["acceptable_amount"] - details["current_amount"]
     ).clip(lower=0)
     details["gap_filled"] = 0.0
-    details["benefit"] = 0.0
+    details["base_normalized_benefit"] = 0.0
 
     benefit_mask = (
         details["reported"]
@@ -81,11 +104,32 @@ def score_candidate_meal(current_score, candidate_nutrients):
     details.loc[benefit_mask, "gap_filled"] = details.loc[
         benefit_mask, ["candidate_amount", "gap_before"]
     ].min(axis=1)
-    details.loc[benefit_mask, "benefit"] = (
+    details.loc[benefit_mask, "base_normalized_benefit"] = (
         details.loc[benefit_mask, "gap_filled"]
         / details.loc[benefit_mask, "reference_amount"]
         * details.loc[benefit_mask, "candidate_coverage_ratio"]
     )
+    details["foundational_multiplier"] = 1.0
+    foundational_gap = (
+        details["nutrient_id"].isin(FOUNDATIONAL_NUTRIENT_IDS)
+        & details["reported"]
+        & details["reference_amount"].notna()
+        & (details["reference_amount"] > 0)
+        & (
+            details["current_amount"] / details["reference_amount"]
+            < ACCEPTABLE_PROGRESS
+        )
+    )
+    details.loc[
+        foundational_gap, "foundational_multiplier"
+    ] = FOUNDATIONAL_BENEFIT_MULTIPLIER
+    details["weighted_benefit"] = (
+        details["base_normalized_benefit"]
+        * details["foundational_multiplier"]
+    )
+    # Keep the established detail name as the effective benefit consumed by
+    # ranking and explanations.
+    details["benefit"] = details["weighted_benefit"]
     details["benefit_based_on_partial_data"] = (
         (details["benefit"] > 0)
         & (details["candidate_coverage_state"] == "partial")
@@ -162,10 +206,12 @@ def score_candidate_meal(current_score, candidate_nutrients):
         "limit_status",
     ] = "approaching_max"
 
-    benefit_score = float(details["benefit"].sum())
+    base_benefit_score = float(details["base_normalized_benefit"].sum())
+    benefit_score = float(details["weighted_benefit"].sum())
     penalty_score = float(details["penalty"].sum())
     return {
         "score": benefit_score - penalty_score,
+        "base_benefit_score": base_benefit_score,
         "benefit_score": benefit_score,
         "penalty_score": penalty_score,
         "nutrients_helped": int((details["benefit"] > 0).sum()),
@@ -254,4 +300,119 @@ def rank_meals(
     return sorted(
         results,
         key=lambda result: (-result["score"], result["meal_name"].lower()),
+    )
+
+
+def select_food_recommendation_gaps(
+    current_score, limit=MAX_FOOD_GAP_NUTRIENTS
+):
+    """Select the largest known, positively useful gaps for SQL prefiltering."""
+    gaps = current_score.copy()
+    gaps["reference_amount"] = gaps["target_amount"].combine_first(
+        gaps["minimum_amount"]
+    )
+    gaps["gap_fraction"] = (
+        ACCEPTABLE_PROGRESS
+        - gaps["amount_consumed"] / gaps["reference_amount"]
+    )
+    gaps = gaps[
+        gaps["reported"]
+        & gaps["reference_amount"].notna()
+        & (gaps["reference_amount"] > 0)
+        & (gaps["gap_fraction"] > 0)
+        & ~gaps["nutrient_id"].isin(NON_BENEFICIAL_TARGET_IDS)
+    ].sort_values(["gap_fraction", "nutrient_id"], ascending=[False, True])
+    return gaps.head(limit)["nutrient_id"].astype(int).tolist()
+
+
+def rank_food_candidates(
+    current_score,
+    candidates,
+    nutrition_engine,
+    preferences=None,
+):
+    """Score an already bounded set of foods using one deterministic portion."""
+    preferences = preferences or {}
+    results = []
+    for candidate in candidates.itertuples(index=False):
+        fdc_id = int(candidate.fdc_id)
+        preference = preferences.get(fdc_id, "neutral")
+        if preference in EXCLUDED_PREFERENCES:
+            continue
+        if preference not in PREFERENCE_BONUSES:
+            raise ValueError(f"Unknown food preference: {preference}")
+
+        nutrients = nutrition_engine.calculate_food_nutrients(
+            fdc_id, float(candidate.gram_weight)
+        )
+        candidate_score = score_candidate_meal(current_score, nutrients)
+        nutrition_score = candidate_score["score"]
+        preference_bonus = PREFERENCE_BONUSES[preference]
+        results.append({
+            "fdc_id": fdc_id,
+            "description": candidate.description,
+            "data_type": candidate.data_type,
+            "brand_name": candidate.brand_name,
+            "brand_owner": candidate.brand_owner,
+            "candidate_class": getattr(candidate, "candidate_class", "ordinary_food"),
+            "classification_reason": getattr(
+                candidate, "classification_reason", "not supplied"
+            ),
+            "reported_nutrient_count": int(candidate.reported_nutrient_count),
+            "portion_id": candidate.portion_id,
+            "portion_amount": candidate.portion_amount,
+            "modifier": candidate.modifier,
+            "portion_unit": candidate.portion_unit,
+            "assumed_grams": float(candidate.gram_weight),
+            **candidate_score,
+            "nutrition_score": nutrition_score,
+            "preference": preference,
+            "preference_bonus": preference_bonus,
+            "score": nutrition_score + preference_bonus,
+        })
+
+    def normalize_identity(value):
+        if value is None:
+            return ""
+        text = str(value).strip().lower()
+        if text in {"", "nan", "<na>"}:
+            return ""
+        return re.sub(r"[^a-z0-9]+", " ", text).strip()
+
+    def identity_key(result):
+        description = normalize_identity(result["description"])
+        modifier = normalize_identity(result["modifier"])
+        grams = round(result["assumed_grams"], 3)
+        if result["data_type"] == "branded_food":
+            # Owner is the stable fallback when USDA records omit brand_name.
+            owner = normalize_identity(result["brand_owner"])
+            brand = normalize_identity(result["brand_name"])
+            return ("branded", description, owner or brand, grams, modifier)
+        return ("generic", description, grams, modifier)
+
+    # Equivalent USDA releases compete without merging any nutrient records.
+    # Score represents nutritional fit; coverage quality and FDC ID break ties.
+    deduplicated = {}
+    for result in results:
+        key = identity_key(result)
+        incumbent = deduplicated.get(key)
+        priority = (
+            result["score"],
+            result["reported_nutrient_count"],
+            -result["fdc_id"],
+        )
+        if incumbent is None or priority > (
+            incumbent["score"],
+            incumbent["reported_nutrient_count"],
+            -incumbent["fdc_id"],
+        ):
+            deduplicated[key] = result
+
+    return sorted(
+        deduplicated.values(),
+        key=lambda result: (
+            -result["score"],
+            result["description"].lower(),
+            result["fdc_id"],
+        ),
     )

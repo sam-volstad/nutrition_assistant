@@ -194,9 +194,6 @@ class NutritionEngine:
             if pd.notna(row["maximum_amount"]) and row["amount_consumed"] > row["maximum_amount"]:
                 return "over_max"
 
-            if row["coverage_state"] == "partial":
-                return "partial"
-
             if pd.notna(row["target_amount"]):
                 progress = row["target_progress"]
             elif pd.notna(row["minimum_amount"]):

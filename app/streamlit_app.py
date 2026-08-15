@@ -1,4 +1,5 @@
 from pathlib import Path
+from threading import RLock
 
 import duckdb
 import pandas as pd
@@ -9,8 +10,13 @@ from nutrition_assistant.engine.nutrition_engine import NutritionEngine
 from nutrition_assistant.models.ingredient import Ingredient
 from nutrition_assistant.models.meal import Meal
 from nutrition_assistant.planner.optimizer import (
+    FOOD_CANDIDATES_PER_NUTRIENT,
+    MAX_FOOD_CANDIDATE_POOL,
+    foundational_gaps_remain,
+    rank_food_candidates,
     rank_meals,
     recommendation_explanation,
+    select_food_recommendation_gaps,
 )
 from nutrition_assistant.repositories.food_repository import FoodRepository
 from nutrition_assistant.repositories.meal_repository import MealRepository
@@ -27,6 +33,7 @@ def get_services(database_path: str):
         PreferenceRepository(food_repository.con),
         TargetRepository(food_repository.con),
         NutritionEngine(food_repository),
+        RLock(),
     )
 
 
@@ -34,6 +41,9 @@ def initialize_session_state() -> None:
     st.session_state.setdefault("meal_ingredients", [])
     st.session_state.setdefault("today_entries", [])
     st.session_state.setdefault("today_recommendation_vetoes", set())
+    st.session_state.setdefault("today_food_recommendation_vetoes", set())
+    if not st.session_state.today_entries:
+        st.session_state.today_food_recommendation_vetoes.clear()
     st.session_state.setdefault("editing_meal_id", None)
     st.session_state.setdefault("meal_library_selection_version", 0)
     st.session_state.setdefault(
@@ -137,6 +147,19 @@ def format_portion(portion) -> str:
     return f"{description} — {amount_text}{unit} ({gram_text})"
 
 
+def format_recommendation_portion(recommendation) -> str:
+    """Describe one validated automatic serving without redundant metadata."""
+    modifier = available_text(recommendation["modifier"])
+    grams = recommendation["assumed_grams"]
+    if modifier:
+        return f"Assumed serving: {modifier} ({grams:g} g)"
+    amount = recommendation["portion_amount"]
+    unit = available_text(recommendation["portion_unit"])
+    if pd.notna(amount) and unit and unit.lower() not in {"g", "gram", "grams"}:
+        return f"Assumed serving: {amount:g} {unit} ({grams:g} g)"
+    return f"Assumed serving: {grams:g} g"
+
+
 def available_text(value):
     if pd.isna(value) or value == "":
         return None
@@ -220,7 +243,6 @@ def score_display(engine, nutrients, targets):
     )
     status_labels = {
         "unknown": "? Unknown",
-        "partial": "◐ Partial data",
         "low": "↓ Low",
         "approaching": "△ Approaching",
         "acceptable": "✓ Good",
@@ -273,7 +295,6 @@ def style_score_display(score_table):
         "↓ Low": "background-color: #ffe0b2; color: #5d3500",
         "! Over maximum": "background-color: #f4cccc; color: #6b1d16",
         "? Unknown": "background-color: #e9ecef; color: #343a40",
-        "◐ Partial data": "background-color: #e2e3e5; color: #343a40",
     }
     return score_table.style.map(
         lambda status: status_colors.get(status, ""),
@@ -677,7 +698,11 @@ def render_saved_meals(
     )
 
 def render_today(
-    meal_repository, preference_repository, target_repository, engine
+    food_repository,
+    meal_repository,
+    preference_repository,
+    target_repository,
+    engine,
 ) -> None:
     st.header("Today")
     entries = st.session_state.today_entries
@@ -689,8 +714,23 @@ def render_today(
         st.info("Add a one-off meal from Meal Builder or a saved Meal Library entry.")
         return
 
+    # Reconcile session references with the live library before dereferencing IDs.
+    # A meal may have been deleted during an earlier rerun or another connection.
+    saved_meals = meal_repository.list_meals()
+    live_meal_ids = set(saved_meals["meal_id"].astype(int).tolist())
+    vetoes.intersection_update(live_meal_ids)
+    entries[:] = [
+        entry
+        for entry in entries
+        if entry["kind"] != "saved" or int(entry["meal_id"]) in live_meal_ids
+    ]
+    if not entries:
+        st.info("No current Today entries remain.")
+        return
+
     meals = []
     saved_meal_ids = []
+    today_fdc_ids = set()
     for index, entry in enumerate(list(entries)):
         if entry["kind"] == "saved":
             meal_id = entry["meal_id"]
@@ -706,10 +746,15 @@ def render_today(
             label = f"{meal.name} · One-off"
 
         meals.append(meal)
+        today_fdc_ids.update(
+            ingredient.fdc_id for ingredient in meal.ingredients
+        )
         description, remove = st.columns([5, 1])
         description.write(label)
         if remove.button("Remove", key=f"remove_today_{index}"):
             entries.pop(index)
+            if not entries:
+                st.session_state.today_food_recommendation_vetoes.clear()
             st.rerun()
 
     if not meals:
@@ -738,7 +783,8 @@ def render_today(
         "Prototype recommendations use reported nutrient data and are not "
         "medical advice or a claim of an objectively optimal diet."
     )
-    saved_meals = meal_repository.list_meals()
+    current_score = engine.score_against_targets(day_nutrients, targets)
+    st.markdown("**Saved meal suggestions**")
     preferences = preference_repository.get_meal_preferences(
         saved_meals["meal_id"].astype(int).tolist()
     )
@@ -750,33 +796,34 @@ def render_today(
             in {"avoid", "never"}
         )
     ]
+    recommendations = []
     if eligible_rows.empty:
         st.info("No other saved meals are available to recommend.")
-        return
-
-    eligible_ids = []
-    eligible_meals = []
-    for row in eligible_rows.itertuples(index=False):
-        try:
-            candidate = meal_repository.get_meal(int(row.meal_id))
-            engine.calculate_meal(candidate)
-        except ValueError as error:
-            st.warning(f'Skipped "{row.meal_name}": {error}')
-            continue
-        eligible_ids.append(int(row.meal_id))
-        eligible_meals.append(candidate)
-
-    if not eligible_meals:
-        st.info("No eligible saved meals could be loaded.")
-        return
-
-    recommendations = rank_meals(
-        current_score=engine.score_against_targets(day_nutrients, targets),
-        meals=eligible_meals,
-        nutrition_engine=engine,
-        meal_ids=eligible_ids,
-        preferences=preferences,
-    )
+    else:
+        eligible_ids = []
+        eligible_meals = []
+        for row in eligible_rows.itertuples(index=False):
+            meal_id = int(row.meal_id)
+            if meal_id not in live_meal_ids:
+                continue
+            try:
+                candidate = meal_repository.get_meal(meal_id)
+                engine.calculate_meal(candidate)
+            except ValueError as error:
+                st.warning(f'Skipped "{row.meal_name}": {error}')
+                continue
+            eligible_ids.append(meal_id)
+            eligible_meals.append(candidate)
+        if eligible_meals:
+            recommendations = rank_meals(
+                current_score=current_score,
+                meals=eligible_meals,
+                nutrition_engine=engine,
+                meal_ids=eligible_ids,
+                preferences=preferences,
+            )
+        else:
+            st.info("No eligible saved meals could be loaded.")
     for rank, recommendation in enumerate(recommendations[:3], start=1):
         benefit_text, warning_text = recommendation_explanation(recommendation)
         with st.container(border=True):
@@ -803,6 +850,85 @@ def render_today(
             ):
                 vetoes.add(recommendation["meal_id"])
                 st.rerun()
+
+    st.markdown("**Food suggestions**")
+    food_vetoes = st.session_state.today_food_recommendation_vetoes
+    if food_vetoes and st.button("Clear food Not today choices"):
+        food_vetoes.clear()
+        st.rerun()
+    gap_ids = select_food_recommendation_gaps(current_score)
+    food_candidates = food_repository.get_recommendation_candidates(
+        gap_ids,
+        excluded_fdc_ids=today_fdc_ids | set(food_vetoes),
+        per_nutrient_limit=FOOD_CANDIDATES_PER_NUTRIENT,
+        pool_limit=MAX_FOOD_CANDIDATE_POOL,
+        require_foundational_contribution=foundational_gaps_remain(current_score),
+    )
+    food_preferences = preference_repository.get_food_preferences(
+        food_candidates.get("fdc_id", pd.Series(dtype=int)).astype(int).tolist()
+    )
+    food_recommendations = rank_food_candidates(
+        current_score,
+        food_candidates,
+        engine,
+        preferences=food_preferences,
+    )
+    if not food_recommendations:
+        st.info("No additional ordinary-food suggestions found.")
+    for rank, recommendation in enumerate(food_recommendations[:3], start=1):
+        benefit_text, warning_text = recommendation_explanation(recommendation)
+        brand = (
+            available_text(recommendation["brand_name"])
+            or available_text(recommendation["brand_owner"])
+        )
+        identity = f" · {brand}" if brand else ""
+        portion = format_recommendation_portion(recommendation)
+        with st.container(border=True):
+            st.markdown(
+                f"**{rank}. {recommendation['description']}**{identity}"
+            )
+            st.write(portion)
+            st.write(benefit_text)
+            if recommendation["upper_limit_warnings"]:
+                st.warning(f"⚠️ {warning_text}")
+            else:
+                st.write(f"✓ {warning_text}")
+            st.caption(
+                f"Score: {recommendation['score']:.3f} "
+                f"(nutrition {recommendation['nutrition_score']:.3f} + "
+                f"preference {recommendation['preference_bonus']:.2f}) · "
+                f"Assumed {recommendation['assumed_grams']:.1f} g"
+            )
+            add, not_today = st.columns(2)
+            fdc_id = recommendation["fdc_id"]
+            if add.button("Add to Today", key=f"add_food_{fdc_id}"):
+                st.session_state.today_entries.append({
+                    "kind": "temporary",
+                    "meal": Meal(
+                        name=recommendation["description"],
+                        ingredients=[Ingredient(
+                            fdc_id=fdc_id,
+                            grams=recommendation["assumed_grams"],
+                            name=recommendation["description"],
+                        )],
+                    ),
+                })
+                st.rerun()
+            if not_today.button("Not today", key=f"veto_food_{fdc_id}"):
+                food_vetoes.add(fdc_id)
+                st.rerun()
+            st.caption("Permanent preference")
+            preferred, acceptable, avoid, never = st.columns(4)
+            actions = (
+                (preferred, "Preferred", "preferred"),
+                (acceptable, "Acceptable", "acceptable"),
+                (avoid, "Avoid", "avoid"),
+                (never, "Never suggest", "never"),
+            )
+            for column, label, preference in actions:
+                if column.button(label, key=f"food_pref_{preference}_{fdc_id}"):
+                    preference_repository.set_food_preference(fdc_id, preference)
+                    st.rerun()
 
 
 def main() -> None:
@@ -832,6 +958,7 @@ def main() -> None:
         preference_repository,
         target_repository,
         engine,
+        database_lock,
     ) = services
     pages = ("Today", "Meal Builder", "Meal Library")
     navigation = st.columns(len(pages))
@@ -845,16 +972,23 @@ def main() -> None:
             st.session_state.active_page = page
             st.rerun()
 
-    if st.session_state.active_page == "Today":
-        render_today(
-            meal_repository, preference_repository, target_repository, engine
-        )
-    elif st.session_state.active_page == "Meal Builder":
-        render_build_meal(food_repository, meal_repository, engine)
-    else:
-        render_saved_meals(
-            meal_repository, preference_repository, target_repository, engine
-        )
+    # All repositories share the cached DuckDB connection. Streamlit reruns may
+    # overlap, so keep one render from replacing another render's pending result.
+    with database_lock:
+        if st.session_state.active_page == "Today":
+            render_today(
+                food_repository,
+                meal_repository,
+                preference_repository,
+                target_repository,
+                engine,
+            )
+        elif st.session_state.active_page == "Meal Builder":
+            render_build_meal(food_repository, meal_repository, engine)
+        else:
+            render_saved_meals(
+                meal_repository, preference_repository, target_repository, engine
+            )
 
 if __name__ == "__main__":
     main()

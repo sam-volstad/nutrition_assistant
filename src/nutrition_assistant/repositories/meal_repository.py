@@ -1,3 +1,5 @@
+import pandas as pd
+
 from nutrition_assistant.models.ingredient import Ingredient
 from nutrition_assistant.models.meal import Meal
 
@@ -148,22 +150,33 @@ class MealRepository:
         )
 
     def list_meals(self):
-        return self.con.execute(
-            """
-            SELECT
-                m.meal_id,
-                m.meal_name,
-                COUNT(mi.fdc_id) AS ingredient_count
-            FROM meals m
-            LEFT JOIN meal_ingredients mi
-                ON m.meal_id = mi.meal_id
-            GROUP BY
-                m.meal_id,
-                m.meal_name
-            ORDER BY
-                m.meal_name
-            """
-        ).fetchdf()
+        # Streamlit reruns can briefly overlap while repositories share the
+        # cached connection. Use an independent cursor so another query cannot
+        # replace this cursor's pending result before it is fetched.
+        cursor = self.con.cursor()
+        try:
+            rows = cursor.execute(
+                """
+                SELECT
+                    m.meal_id,
+                    m.meal_name,
+                    COUNT(mi.fdc_id) AS ingredient_count
+                FROM meals m
+                LEFT JOIN meal_ingredients mi
+                    ON m.meal_id = mi.meal_id
+                GROUP BY
+                    m.meal_id,
+                    m.meal_name
+                ORDER BY
+                    m.meal_name
+                """
+            ).fetchall()
+        finally:
+            cursor.close()
+        return pd.DataFrame.from_records(
+            rows,
+            columns=["meal_id", "meal_name", "ingredient_count"],
+        )
 
     def delete_meal(self, meal_id: int):
         self.con.execute("BEGIN TRANSACTION")
