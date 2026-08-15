@@ -36,6 +36,10 @@ def initialize_session_state() -> None:
     st.session_state.setdefault("today_recommendation_vetoes", set())
     st.session_state.setdefault("editing_meal_id", None)
     st.session_state.setdefault("meal_library_selection_version", 0)
+    st.session_state.setdefault(
+        "active_page",
+        "Today" if st.session_state.today_entries else "Meal Builder",
+    )
     deleted_meal_id = st.session_state.pop("pending_deleted_meal_id", None)
     if deleted_meal_id is not None:
         clear_deleted_meal_state(st.session_state, deleted_meal_id)
@@ -569,13 +573,21 @@ def render_saved_meals(
     current_preference = preference_repository.get_meal_preference(
         selected_meal_id
     )
-    selected_preference = st.selectbox(
+    preference_values = {
+        label: value for value, label in preference_labels.items()
+    }
+    preference_label, preference_control = st.columns([2, 3])
+    preference_label.markdown("**Recommendation preference**")
+    selected_preference_label = preference_control.selectbox(
         "Recommendation preference",
-        list(preference_labels),
-        index=list(preference_labels).index(current_preference),
-        format_func=preference_labels.get,
+        list(preference_values),
+        index=list(preference_values).index(
+            preference_labels[current_preference]
+        ),
         key=f"meal_preference_{selected_meal_id}",
+        label_visibility="collapsed",
     )
+    selected_preference = preference_values[selected_preference_label]
     if selected_preference != current_preference:
         try:
             preference_repository.set_meal_preference(
@@ -607,6 +619,7 @@ def render_saved_meals(
             ],
         }
         st.session_state.builder_loaded_notice = True
+        st.session_state.active_page = "Meal Builder"
         st.rerun()
     if delete.button("Delete meal", key="library_delete"):
         st.session_state.confirm_delete_meal_id = selected_meal_id
@@ -801,16 +814,25 @@ def main() -> None:
         target_repository,
         engine,
     ) = services
-    today_tab, build_tab, saved_tab = st.tabs(
-        ["Today", "Meal Builder", "Meal Library"]
-    )
-    with today_tab:
+    pages = ("Today", "Meal Builder", "Meal Library")
+    navigation = st.columns(len(pages))
+    for column, page in zip(navigation, pages):
+        if column.button(
+            page,
+            key=f"navigate_{page.lower().replace(' ', '_')}",
+            type="primary" if st.session_state.active_page == page else "secondary",
+            width="stretch",
+        ):
+            st.session_state.active_page = page
+            st.rerun()
+
+    if st.session_state.active_page == "Today":
         render_today(
             meal_repository, preference_repository, target_repository, engine
         )
-    with build_tab:
+    elif st.session_state.active_page == "Meal Builder":
         render_build_meal(food_repository, meal_repository, engine)
-    with saved_tab:
+    else:
         render_saved_meals(
             meal_repository, preference_repository, target_repository, engine
         )
