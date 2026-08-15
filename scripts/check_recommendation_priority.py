@@ -10,6 +10,7 @@ from nutrition_assistant.planner.optimizer import (
     PREFERENCE_BONUSES,
     UPPER_LIMIT_PENALTY,
     rank_meals,
+    recommendation_explanation,
     score_candidate_meal,
 )
 
@@ -76,6 +77,27 @@ def main() -> None:
     ].iloc[0]
     assert fiber_detail["foundational_multiplier"] == FOUNDATIONAL_BENEFIT_MULTIPLIER
     assert fiber_detail["weighted_benefit"] == 0.4
+
+    explanation = score_candidate_meal(
+        low,
+        candidate(fiber=9.0, energy=400.0, vitamin_c=50.0),
+    )
+    assert explanation["major_nutrients_helped"] == [
+        "Fiber", "Energy", "Vitamin C"
+    ]
+    assert [
+        detail["name"] for detail in explanation["explanation_nutrient_details"][:3]
+    ] == explanation["major_nutrients_helped"]
+    assert recommendation_explanation(explanation)[0] == (
+        "Helps: Fiber, Energy, Vitamin C"
+    )
+    protein_explanation = score_candidate_meal(
+        low,
+        candidate(protein=10.0, energy=100.0, vitamin_c=50.0),
+    )
+    assert protein_explanation["major_nutrients_helped"] == [
+        "Protein", "Energy", "Vitamin C"
+    ]
 
     covered = current_score(0.90)
     assert score_candidate_meal(

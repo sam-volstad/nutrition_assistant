@@ -17,6 +17,7 @@ EXCLUDED_PREFERENCES = {"avoid", "never"}
 MAX_FOOD_GAP_NUTRIENTS = 5
 FOOD_CANDIDATES_PER_NUTRIENT = 12
 MAX_FOOD_CANDIDATE_POOL = 40
+VISIBLE_FOOD_RECOMMENDATIONS = 5
 
 
 def foundational_gaps_remain(current_score) -> bool:
@@ -177,8 +178,18 @@ def score_candidate_meal(current_score, candidate_nutrients):
             / details.loc[over_max_mask, "maximum_amount"]
         )
 
-    helped = details[details["benefit"] > 0].sort_values(
-        "benefit", ascending=False
+    helped = details[details["benefit"] > 0].copy()
+    helped["foundational"] = helped["nutrient_id"].isin(
+        FOUNDATIONAL_NUTRIENT_IDS
+    )
+    foundational_helped = helped[helped["foundational"]].sort_values(
+        ["weighted_benefit", "nutrient_id"], ascending=[False, True]
+    )
+    other_helped = helped[~helped["foundational"]].sort_values(
+        ["weighted_benefit", "nutrient_id"], ascending=[False, True]
+    )
+    explanation_helped = pd.concat(
+        [foundational_helped, other_helped], ignore_index=True
     )
     known_limit_warnings = details[
         details["maximum_amount"].notna()
@@ -215,9 +226,13 @@ def score_candidate_meal(current_score, candidate_nutrients):
         "benefit_score": benefit_score,
         "penalty_score": penalty_score,
         "nutrients_helped": int((details["benefit"] > 0).sum()),
-        "major_nutrients_helped": helped["name"].head(3).tolist(),
-        "partial_benefit_nutrients": helped.loc[
-            helped["benefit_based_on_partial_data"], "name"
+        "major_nutrients_helped": explanation_helped["name"].head(3).tolist(),
+        "explanation_nutrient_details": explanation_helped[
+            ["nutrient_id", "name", "base_normalized_benefit",
+             "foundational_multiplier", "weighted_benefit", "foundational"]
+        ].to_dict("records"),
+        "partial_benefit_nutrients": explanation_helped.loc[
+            explanation_helped["benefit_based_on_partial_data"], "name"
         ].tolist(),
         "upper_limit_warnings": known_limit_warnings[
             ["name", "unit_name", "projected_amount", "known_subtotal_after",

@@ -12,6 +12,7 @@ from nutrition_assistant.models.meal import Meal
 from nutrition_assistant.planner.optimizer import (
     FOOD_CANDIDATES_PER_NUTRIENT,
     MAX_FOOD_CANDIDATE_POOL,
+    VISIBLE_FOOD_RECOMMENDATIONS,
     foundational_gaps_remain,
     rank_food_candidates,
     rank_meals,
@@ -875,7 +876,9 @@ def render_today(
     )
     if not food_recommendations:
         st.info("No additional ordinary-food suggestions found.")
-    for rank, recommendation in enumerate(food_recommendations[:3], start=1):
+    for rank, recommendation in enumerate(
+        food_recommendations[:VISIBLE_FOOD_RECOMMENDATIONS], start=1
+    ):
         benefit_text, warning_text = recommendation_explanation(recommendation)
         brand = (
             available_text(recommendation["brand_name"])

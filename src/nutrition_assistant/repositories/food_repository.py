@@ -10,6 +10,7 @@ FOUNDATIONAL_SERVING_THRESHOLDS = {
     "protein_per_serving": 5.0,
     "fiber_per_serving": 3.0,
 }
+CLASSIFICATION_PREFILTER_MULTIPLIER = 4
 
 
 class FoodRepository:
@@ -278,11 +279,14 @@ class FoodRepository:
                           )
                   )"""
             parameters.extend(excluded_fdc_ids)
-        parameters.append(per_nutrient_limit)
-        # At most one bounded contributor per gap/rank enters classification.
-        # Filtering occurs before detailed nutrition scoring, then the public
-        # candidate pool is capped at pool_limit.
-        prefilter_limit = len(nutrient_ids) * per_nutrient_limit
+        contributor_limit = (
+            per_nutrient_limit * CLASSIFICATION_PREFILTER_MULTIPLIER
+        )
+        parameters.append(contributor_limit)
+        # A fixed-depth metadata prefilter leaves room for classification and
+        # identity vetoes to refill results. Detailed scoring still receives
+        # no more than pool_limit candidates.
+        prefilter_limit = len(nutrient_ids) * contributor_limit
         parameters.append(prefilter_limit)
 
         candidates = self.con.execute(
