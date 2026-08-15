@@ -209,6 +209,14 @@ def _create_application_schema(connection) -> None:
             PRIMARY KEY (profile_id, nutrient_id)
         )
         """,
+        """
+        CREATE TABLE IF NOT EXISTS meal_preferences (
+            meal_id BIGINT PRIMARY KEY,
+            preference VARCHAR NOT NULL CHECK (
+                preference IN ('preferred', 'acceptable', 'neutral', 'avoid', 'never')
+            )
+        )
+        """,
     )
 
     for statement in statements:

@@ -181,6 +181,13 @@ class MealRepository:
                 [meal_id],
             )
             self.con.execute(
+                """
+                DELETE FROM meal_preferences
+                WHERE meal_id = ?
+                """,
+                [meal_id],
+            )
+            self.con.execute(
                 "DELETE FROM meals WHERE meal_id = ?",
                 [meal_id],
             )

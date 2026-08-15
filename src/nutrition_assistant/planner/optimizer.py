@@ -4,6 +4,12 @@ import pandas as pd
 ACCEPTABLE_PROGRESS = 0.90
 UPPER_LIMIT_PENALTY = 100.0
 NON_BENEFICIAL_TARGET_IDS = {1093}  # Sodium should not be rewarded as a gap.
+PREFERENCE_BONUSES = {
+    "neutral": 0.0,
+    "acceptable": 0.05,
+    "preferred": 0.10,
+}
+EXCLUDED_PREFERENCES = {"avoid", "never"}
 
 
 def score_candidate_meal(current_score, candidate_nutrients):
@@ -120,6 +126,10 @@ def recommendation_explanation(recommendation):
         if helped
         else "No currently known nutrient gaps helped"
     )
+    if recommendation.get("preference") == "preferred":
+        benefit_text = "Preferred meal • " + benefit_text
+    elif recommendation.get("preference") == "acceptable":
+        benefit_text = "Acceptable meal • " + benefit_text
 
     warnings = recommendation["upper_limit_warnings"]
     if not warnings:
@@ -135,21 +145,40 @@ def recommendation_explanation(recommendation):
     return benefit_text, warning_text
 
 
-def rank_meals(current_score, meals, nutrition_engine, meal_ids=None):
+def rank_meals(
+    current_score,
+    meals,
+    nutrition_engine,
+    meal_ids=None,
+    preferences=None,
+):
     if meal_ids is None:
         meal_ids = [None] * len(meals)
     if len(meal_ids) != len(meals):
         raise ValueError("meal_ids must match the number of meals")
 
+    preferences = preferences or {}
     results = []
     for meal_id, meal in zip(meal_ids, meals):
+        preference = preferences.get(meal_id, "neutral")
+        if preference in EXCLUDED_PREFERENCES:
+            continue
+        if preference not in PREFERENCE_BONUSES:
+            raise ValueError(f"Unknown meal preference: {preference}")
+
         nutrients = nutrition_engine.calculate_meal(meal)
         candidate_score = score_candidate_meal(current_score, nutrients)
+        nutrition_score = candidate_score["score"]
+        preference_bonus = PREFERENCE_BONUSES[preference]
         results.append({
             "meal_id": meal_id,
             "meal": meal,
             "meal_name": meal.name,
             **candidate_score,
+            "nutrition_score": nutrition_score,
+            "preference": preference,
+            "preference_bonus": preference_bonus,
+            "score": nutrition_score + preference_bonus,
         })
 
     return sorted(

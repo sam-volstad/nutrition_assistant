@@ -14,6 +14,7 @@ from nutrition_assistant.planner.optimizer import (
 )
 from nutrition_assistant.repositories.food_repository import FoodRepository
 from nutrition_assistant.repositories.meal_repository import MealRepository
+from nutrition_assistant.repositories.preference_repository import PreferenceRepository
 from nutrition_assistant.repositories.target_repository import TargetRepository
 
 
@@ -23,6 +24,7 @@ def get_services(database_path: str):
     return (
         food_repository,
         MealRepository(food_repository.con),
+        PreferenceRepository(food_repository.con),
         TargetRepository(food_repository.con),
         NutritionEngine(food_repository),
     )
@@ -31,12 +33,53 @@ def get_services(database_path: str):
 def initialize_session_state() -> None:
     st.session_state.setdefault("meal_ingredients", [])
     st.session_state.setdefault("today_entries", [])
+    st.session_state.setdefault("today_recommendation_vetoes", set())
     st.session_state.setdefault("editing_meal_id", None)
+    st.session_state.setdefault("meal_library_selection_version", 0)
+    deleted_meal_id = st.session_state.pop("pending_deleted_meal_id", None)
+    if deleted_meal_id is not None:
+        clear_deleted_meal_state(st.session_state, deleted_meal_id)
     pending = st.session_state.pop("pending_builder_meal", None)
     if pending is not None:
         st.session_state.meal_ingredients = pending["ingredients"]
         st.session_state.editing_meal_id = pending["meal_id"]
         st.session_state.builder_meal_name = pending["name"]
+
+
+def clear_deleted_meal_state(state, deleted_meal_id: int) -> None:
+    """Remove only session references tied to a successfully deleted meal."""
+    state["today_entries"] = [
+        entry
+        for entry in state.get("today_entries", [])
+        if not (
+            entry["kind"] == "saved"
+            and entry["meal_id"] == deleted_meal_id
+        )
+    ]
+    state.get("today_recommendation_vetoes", set()).discard(deleted_meal_id)
+
+    selection_version = state.get("meal_library_selection_version", 0)
+    state.pop(f"selected_saved_meal_{selection_version}", None)
+    state["meal_library_selection_version"] = selection_version + 1
+    if state.get("confirm_delete_meal_id") == deleted_meal_id:
+        state.pop("confirm_delete_meal_id", None)
+    state.pop(f"meal_preference_{deleted_meal_id}", None)
+
+    pending_builder = state.get("pending_builder_meal")
+    editing_deleted_meal = state.get("editing_meal_id") == deleted_meal_id
+    pending_deleted_meal = (
+        pending_builder is not None
+        and pending_builder.get("meal_id") == deleted_meal_id
+    )
+    if editing_deleted_meal or pending_deleted_meal:
+        state["editing_meal_id"] = None
+        state["meal_ingredients"] = []
+        state.pop("pending_builder_meal", None)
+        state.pop("builder_meal_name", None)
+        state.pop("builder_loaded_notice", None)
+        for key in list(state):
+            if str(key).startswith(f"builder_grams_{deleted_meal_id}_"):
+                state.pop(key, None)
 
 
 def meal_from_builder(name: str = "Custom meal") -> Meal:
@@ -465,7 +508,9 @@ def render_build_meal(food_repository, meal_repository, engine) -> None:
                         st.rerun()
 
 
-def render_saved_meals(meal_repository, target_repository, engine) -> None:
+def render_saved_meals(
+    meal_repository, preference_repository, target_repository, engine
+) -> None:
     st.header("Meal Library")
     meals = meal_repository.list_meals()
     if meals.empty:
@@ -481,7 +526,10 @@ def render_saved_meals(meal_repository, target_repository, engine) -> None:
         "Library meal",
         meal_ids,
         format_func=labels.get,
-        key="selected_saved_meal",
+        key=(
+            "selected_saved_meal_"
+            f"{st.session_state.meal_library_selection_version}"
+        ),
     )
 
     try:
@@ -500,6 +548,36 @@ def render_saved_meals(meal_repository, target_repository, engine) -> None:
         hide_index=True,
         width="stretch",
     )
+
+    preference_labels = {
+        "preferred": "Preferred",
+        "acceptable": "Acceptable",
+        "neutral": "Neutral",
+        "avoid": "Avoid",
+        "never": "Never suggest",
+    }
+    current_preference = preference_repository.get_meal_preference(
+        selected_meal_id
+    )
+    selected_preference = st.selectbox(
+        "Recommendation preference",
+        list(preference_labels),
+        index=list(preference_labels).index(current_preference),
+        format_func=preference_labels.get,
+        key=f"meal_preference_{selected_meal_id}",
+    )
+    if selected_preference != current_preference:
+        try:
+            preference_repository.set_meal_preference(
+                selected_meal_id, selected_preference
+            )
+        except ValueError as error:
+            st.error(str(error))
+        else:
+            st.toast(
+                f"Preference set to {preference_labels[selected_preference]}."
+            )
+            st.rerun()
 
     add, edit, delete = st.columns(3)
     if add.button("Add to Today", key="library_add_today"):
@@ -532,14 +610,7 @@ def render_saved_meals(meal_repository, target_repository, engine) -> None:
             except ValueError as error:
                 st.error(str(error))
             else:
-                st.session_state.confirm_delete_meal_id = None
-                st.session_state.today_entries = [
-                    entry for entry in st.session_state.today_entries
-                    if not (
-                        entry["kind"] == "saved"
-                        and entry["meal_id"] == selected_meal_id
-                    )
-                ]
+                st.session_state.pending_deleted_meal_id = selected_meal_id
                 st.rerun()
         if cancel.button("Cancel deletion"):
             st.session_state.confirm_delete_meal_id = None
@@ -563,9 +634,15 @@ def render_saved_meals(meal_repository, target_repository, engine) -> None:
         width="stretch",
     )
 
-def render_today(meal_repository, target_repository, engine) -> None:
+def render_today(
+    meal_repository, preference_repository, target_repository, engine
+) -> None:
     st.header("Today")
     entries = st.session_state.today_entries
+    vetoes = st.session_state.today_recommendation_vetoes
+    if vetoes and st.button("Clear today's Not today choices"):
+        vetoes.clear()
+        st.rerun()
     if not entries:
         st.info("Add a one-off meal from Meal Builder or a saved Meal Library entry.")
         return
@@ -620,7 +697,17 @@ def render_today(meal_repository, target_repository, engine) -> None:
         "medical advice or a claim of an objectively optimal diet."
     )
     saved_meals = meal_repository.list_meals()
-    eligible_rows = saved_meals[~saved_meals["meal_id"].isin(saved_meal_ids)]
+    preferences = preference_repository.get_meal_preferences(
+        saved_meals["meal_id"].astype(int).tolist()
+    )
+    excluded_ids = set(saved_meal_ids) | set(vetoes)
+    eligible_rows = saved_meals[
+        ~saved_meals["meal_id"].isin(excluded_ids)
+        & ~saved_meals["meal_id"].map(
+            lambda meal_id: preferences.get(int(meal_id), "neutral")
+            in {"avoid", "never"}
+        )
+    ]
     if eligible_rows.empty:
         st.info("No other saved meals are available to recommend.")
         return
@@ -646,6 +733,7 @@ def render_today(meal_repository, target_repository, engine) -> None:
         meals=eligible_meals,
         nutrition_engine=engine,
         meal_ids=eligible_ids,
+        preferences=preferences,
     )
     for rank, recommendation in enumerate(recommendations[:3], start=1):
         benefit_text, warning_text = recommendation_explanation(recommendation)
@@ -657,14 +745,21 @@ def render_today(meal_repository, target_repository, engine) -> None:
             else:
                 st.write(f"✓ {warning_text}")
             st.caption(
-                f"Score: {recommendation['score']:.3f} · "
+                f"Score: {recommendation['score']:.3f} "
+                f"(nutrition {recommendation['nutrition_score']:.3f} + "
+                f"preference {recommendation['preference_bonus']:.2f}) · "
                 f"Gaps helped: {recommendation['nutrients_helped']}"
             )
-            if st.button(
-                "Add to Today",
-                key=f"add_recommendation_{recommendation['meal_id']}",
+            add, not_today = st.columns(2)
+            if add.button(
+                "Add to Today", key=f"add_recommendation_{recommendation['meal_id']}"
             ):
                 add_saved_meal_to_today(recommendation["meal_id"])
+                st.rerun()
+            if not_today.button(
+                "Not today", key=f"veto_recommendation_{recommendation['meal_id']}"
+            ):
+                vetoes.add(recommendation["meal_id"])
                 st.rerun()
 
 
@@ -689,16 +784,26 @@ def main() -> None:
         st.error(f"Could not open the nutrition database: {error}")
         st.stop()
 
-    food_repository, meal_repository, target_repository, engine = services
+    (
+        food_repository,
+        meal_repository,
+        preference_repository,
+        target_repository,
+        engine,
+    ) = services
     today_tab, build_tab, saved_tab = st.tabs(
         ["Today", "Meal Builder", "Meal Library"]
     )
     with today_tab:
-        render_today(meal_repository, target_repository, engine)
+        render_today(
+            meal_repository, preference_repository, target_repository, engine
+        )
     with build_tab:
         render_build_meal(food_repository, meal_repository, engine)
     with saved_tab:
-        render_saved_meals(meal_repository, target_repository, engine)
+        render_saved_meals(
+            meal_repository, preference_repository, target_repository, engine
+        )
 
 if __name__ == "__main__":
     main()
