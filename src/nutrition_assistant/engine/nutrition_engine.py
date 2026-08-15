@@ -29,6 +29,32 @@ class NutritionEngine:
         quantity=1,
         portion_id=None
     ):
+        grams = self.resolve_portion_grams(
+            fdc_id=fdc_id,
+            quantity=quantity,
+            portion_id=portion_id,
+        )
+
+        return self.calculate_food_nutrients(
+            fdc_id=fdc_id,
+            grams=grams
+        )
+
+    def get_usable_portions(self, fdc_id):
+        portions = self.food_repository.get_portions(fdc_id)
+        if portions.empty:
+            return portions
+
+        return portions[
+            portions.apply(self._has_usable_gram_weight, axis=1)
+        ].copy()
+
+    def resolve_portion_grams(
+        self,
+        fdc_id,
+        quantity=1,
+        portion_id=None,
+    ):
         if not math.isfinite(quantity) or quantity <= 0:
             raise ValueError("quantity must be a positive finite number")
 
@@ -74,12 +100,7 @@ class NutritionEngine:
 
             portion = usable.iloc[0]
 
-        grams = portion["gram_weight"] * quantity
-
-        return self.calculate_food_nutrients(
-            fdc_id=fdc_id,
-            grams=grams
-        )
+        return float(portion["gram_weight"] * quantity)
 
     def calculate_meal(self, meal):
         if not meal.ingredients:
