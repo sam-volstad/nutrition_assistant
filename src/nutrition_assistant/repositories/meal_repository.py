@@ -10,33 +10,48 @@ class MealRepository:
         if not meal.ingredients:
             raise ValueError("Meal contains no ingredients")
 
-        result = self.con.execute(
-            """
-            INSERT INTO meals (meal_name)
-            VALUES (?)
-            RETURNING meal_id
-            """,
-            [meal.name],
-        ).fetchone()
+        fdc_ids = [ingredient.fdc_id for ingredient in meal.ingredients]
+        if len(fdc_ids) != len(set(fdc_ids)):
+            raise ValueError("Meal contains duplicate fdc_id values")
 
-        meal_id = result[0]
+        self.con.execute("BEGIN TRANSACTION")
+        try:
+            placeholders = ", ".join("?" for _ in fdc_ids)
+            existing_ids = {
+                row[0]
+                for row in self.con.execute(
+                    f"SELECT fdc_id FROM food WHERE fdc_id IN ({placeholders})",
+                    fdc_ids,
+                ).fetchall()
+            }
+            missing_ids = sorted(set(fdc_ids) - existing_ids)
+            if missing_ids:
+                raise ValueError(f"Unknown fdc_id values: {missing_ids}")
 
-        for ingredient in meal.ingredients:
-            self.con.execute(
+            result = self.con.execute(
                 """
-                INSERT INTO meal_ingredients (
-                    meal_id,
-                    fdc_id,
-                    grams
-                )
-                VALUES (?, ?, ?)
+                INSERT INTO meals (meal_name)
+                VALUES (?)
+                RETURNING meal_id
                 """,
-                [
-                    meal_id,
-                    ingredient.fdc_id,
-                    ingredient.grams,
-                ],
-            )
+                [meal.name],
+            ).fetchone()
+
+            meal_id = result[0]
+
+            for ingredient in meal.ingredients:
+                self.con.execute(
+                    """
+                    INSERT INTO meal_ingredients (meal_id, fdc_id, grams)
+                    VALUES (?, ?, ?)
+                    """,
+                    [meal_id, ingredient.fdc_id, ingredient.grams],
+                )
+
+            self.con.execute("COMMIT")
+        except Exception:
+            self.con.execute("ROLLBACK")
+            raise
 
         return meal_id
 
@@ -101,30 +116,25 @@ class MealRepository:
         ).fetchdf()
 
     def delete_meal(self, meal_id: int):
-        exists = self.con.execute(
-            """
-            SELECT 1
-            FROM meals
-            WHERE meal_id = ?
-            """,
-            [meal_id],
-        ).fetchone()
+        self.con.execute("BEGIN TRANSACTION")
+        try:
+            exists = self.con.execute(
+                "SELECT 1 FROM meals WHERE meal_id = ?",
+                [meal_id],
+            ).fetchone()
 
-        if exists is None:
-            raise ValueError(f"Unknown meal_id: {meal_id}")
+            if exists is None:
+                raise ValueError(f"Unknown meal_id: {meal_id}")
 
-        self.con.execute(
-            """
-            DELETE FROM meal_ingredients
-            WHERE meal_id = ?
-            """,
-            [meal_id],
-        )
-
-        self.con.execute(
-            """
-            DELETE FROM meals
-            WHERE meal_id = ?
-            """,
-            [meal_id],
-        )
+            self.con.execute(
+                "DELETE FROM meal_ingredients WHERE meal_id = ?",
+                [meal_id],
+            )
+            self.con.execute(
+                "DELETE FROM meals WHERE meal_id = ?",
+                [meal_id],
+            )
+            self.con.execute("COMMIT")
+        except Exception:
+            self.con.execute("ROLLBACK")
+            raise

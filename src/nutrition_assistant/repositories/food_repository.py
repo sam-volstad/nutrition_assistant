@@ -1,8 +1,17 @@
+from pathlib import Path
+
 import duckdb
 
 
 class FoodRepository:
     def __init__(self, db_path):
+        db_path = Path(db_path)
+        if not db_path.is_file():
+            raise FileNotFoundError(
+                f"Nutrition database not found at {db_path}. "
+                "Run initialize_database() first."
+            )
+
         self.con = duckdb.connect(str(db_path))
 
     def search(self, search_term, limit=20):

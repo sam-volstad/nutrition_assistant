@@ -101,7 +101,7 @@ class NutritionEngine:
                 ["nutrient_id", "name", "unit_name"],
                 as_index=False
             )["amount_consumed"]
-            .sum()
+            .sum(min_count=1)
         )
 
         return meal_totals
@@ -124,7 +124,6 @@ class NutritionEngine:
             how="left"
         )
 
-        # Missing USDA nutrient rows stay missing, not zero.
         scored["reported"] = scored["amount_consumed"].notna()
 
         scored["target_progress"] = (
@@ -147,8 +146,26 @@ class NutritionEngine:
             - scored["amount_consumed"]
         ).clip(lower=0)
 
-        return scored
+        def get_status(row):
+            if not row["reported"]:
+                return "unknown"
 
+            if pd.notna(row["maximum_amount"]) and row["amount_consumed"] > row["maximum_amount"]:
+                return "over_max"
+
+            if pd.notna(row["minimum_amount"]) and row["amount_consumed"] < row["minimum_amount"]:
+                return "below_minimum"
+
+            if pd.notna(row["target_amount"]):
+                if row["amount_consumed"] < row["target_amount"]:
+                    return "below_target"
+                return "met"
+
+            return "within_limit"
+
+        scored["status"] = scored.apply(get_status, axis=1)
+
+        return scored
 
     def calculate_day(self, meals):
         if not meals:
@@ -166,7 +183,7 @@ class NutritionEngine:
                 ["nutrient_id", "name", "unit_name"],
                 as_index=False
             )["amount_consumed"]
-            .sum()
+            .sum(min_count=1)
         )
 
         return day_totals
@@ -177,10 +194,14 @@ class NutritionEngine:
             "name",
             "unit_name",
             "amount_consumed",
+            "minimum_amount",
             "target_amount",
             "maximum_amount",
+            "minimum_progress",
             "target_progress",
+            "maximum_progress",
             "remaining_to_target",
+            "status",
             "reported"
         ]
 
