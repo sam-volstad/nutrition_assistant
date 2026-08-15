@@ -53,26 +53,37 @@ class FoodRepository:
                 f"{description} {serving}",
             )
         )
+        protein_concentrate = re.search(
+            r"\b(protein powder|whey protein|casein protein|"
+            r"meal replacement (?:powder|mix)|protein shake mix)\b",
+            description,
+        )
         if (
             "supplement" in category
             or bool(category_parts & {"vitamins", "minerals"})
             or supplement_phrase
             or performance_concentrate
+            or protein_concentrate
         ):
             reason = (
                 "performance-compound concentrate wording"
                 if performance_concentrate
-                else "explicit supplement metadata"
+                else (
+                    "protein or meal-replacement concentrate wording"
+                    if protein_concentrate
+                    else "explicit supplement metadata"
+                )
             )
             return "supplement_like", reason
 
         ingredient_category = re.search(
             r"\b(spices and herbs|spices|seasonings|flour(?:s)? and cornmeal|"
-            r"baking ingredients|baking supplies)\b",
+            r"baking ingredients|baking supplies|baking additives)\b",
             category,
         )
         ingredient_description = re.search(
             r"\b(cocoa|cacao)\b.*\bpowder\b|"
+            r"\bagar(?:-agar)?\b.*\bpowder\b|"
             r"\b(powdered (?:milk|peanut butter)|baking powder|cornstarch)\b|"
             r"\b(curry|mustard|garlic|onion|chili) powder\b|"
             r"\b(flour|meal concentrate)\b",
@@ -215,12 +226,59 @@ class FoodRepository:
             dict.fromkeys(int(value) for value in (excluded_fdc_ids or []))
         )
         nutrient_placeholders = ", ".join("?" for _ in nutrient_ids)
+        excluded_products_cte = ""
         exclusion_sql = ""
-        parameters = [*nutrient_ids, per_nutrient_limit]
+        parameters = [*nutrient_ids]
         if excluded_fdc_ids:
             exclusion_placeholders = ", ".join("?" for _ in excluded_fdc_ids)
-            exclusion_sql = f"AND ci.fdc_id NOT IN ({exclusion_placeholders})"
+            excluded_products_cte = f""",
+            excluded_products AS (
+                SELECT
+                    CASE WHEN f.data_type = 'branded_food'
+                        THEN 'branded' ELSE 'generic' END AS identity_type,
+                    regexp_replace(
+                        lower(trim(COALESCE(f.description, ''))),
+                        '[^a-z0-9]+', ' ', 'g'
+                    ) AS identity_description,
+                    regexp_replace(
+                        lower(trim(COALESCE(bm.brand_owner, bm.brand_name, ''))),
+                        '[^a-z0-9]+', ' ', 'g'
+                    ) AS identity_brand,
+                    round(dp.gram_weight, 3) AS identity_grams,
+                    regexp_replace(
+                        lower(trim(COALESCE(dp.modifier, ''))),
+                        '[^a-z0-9]+', ' ', 'g'
+                    ) AS identity_modifier
+                FROM food f
+                JOIN deterministic_portions dp USING (fdc_id)
+                LEFT JOIN branded_metadata bm USING (fdc_id)
+                WHERE f.fdc_id IN ({exclusion_placeholders})
+            )"""
+            exclusion_sql = """
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM excluded_products ep
+                      WHERE ep.identity_type = CASE
+                              WHEN f.data_type = 'branded_food'
+                              THEN 'branded' ELSE 'generic' END
+                        AND ep.identity_description = regexp_replace(
+                              lower(trim(COALESCE(f.description, ''))),
+                              '[^a-z0-9]+', ' ', 'g'
+                          )
+                        AND ep.identity_brand = regexp_replace(
+                              lower(trim(COALESCE(
+                                  bm.brand_owner, bm.brand_name, ''
+                              ))),
+                              '[^a-z0-9]+', ' ', 'g'
+                          )
+                        AND ep.identity_grams = round(dp.gram_weight, 3)
+                        AND ep.identity_modifier = regexp_replace(
+                              lower(trim(COALESCE(dp.modifier, ''))),
+                              '[^a-z0-9]+', ' ', 'g'
+                          )
+                  )"""
             parameters.extend(excluded_fdc_ids)
+        parameters.append(per_nutrient_limit)
         # At most one bounded contributor per gap/rank enters classification.
         # Filtering occurs before detailed nutrition scoring, then the public
         # candidate pool is capped at pool_limit.
@@ -312,7 +370,8 @@ class FoodRepository:
                   AND TRY_CAST(fn.amount AS DOUBLE) > 0
                   AND isfinite(TRY_CAST(fn.amount AS DOUBLE))
                 GROUP BY fn.fdc_id, fn.nutrient_id
-            ),
+            )
+            {excluded_products_cte},
             foundational_contributions AS (
                 SELECT
                     fn.fdc_id,
@@ -335,6 +394,16 @@ class FoodRepository:
                 ) OR (
                     nutrient_id IN (1003, 1004, 1005, 1079)
                     AND TRY_CAST(amount AS DOUBLE) > 105
+                ) OR (
+                    -- More than 100 g of calcium per 100 g is physically
+                    -- impossible; malformed branded rows exceed this bound.
+                    nutrient_id = 1087
+                    AND TRY_CAST(amount AS DOUBLE) > 100000
+                ) OR (
+                    -- Zinc above 1% by mass is not plausible ordinary food;
+                    -- valid fortified records in this dataset remain below it.
+                    nutrient_id = 1095
+                    AND TRY_CAST(amount AS DOUBLE) > 1000
                 )
             ),
             ranked_contributors AS (
@@ -377,6 +446,7 @@ class FoodRepository:
                       )
                   )
                   AND COALESCE(pref.preference, 'neutral') NOT IN ('avoid', 'never')
+                  {exclusion_sql}
             ),
             bounded AS (
                 SELECT *
@@ -421,7 +491,6 @@ class FoodRepository:
             LEFT JOIN branded_metadata bm USING (fdc_id)
             LEFT JOIN food_preferences pref USING (fdc_id)
             WHERE COALESCE(pref.preference, 'neutral') NOT IN ('avoid', 'never')
-              {exclusion_sql}
             ORDER BY
                 ci.gaps_matched DESC,
                 ci.best_contributor_rank,
