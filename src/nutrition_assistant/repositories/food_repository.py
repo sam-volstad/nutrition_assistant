@@ -16,24 +16,67 @@ class FoodRepository:
 
     def search(self, search_term, limit=20):
         return self.con.execute("""
+            WITH matches AS (
+                SELECT
+                    fdc_id,
+                    description,
+                    data_type,
+                    food_category_id,
+                    CASE data_type
+                        WHEN 'foundation_food' THEN 1
+                        WHEN 'sr_legacy_food' THEN 2
+                        WHEN 'survey_fndds_food' THEN 3
+                        WHEN 'branded_food' THEN 4
+                        ELSE 5
+                    END AS data_type_rank
+                FROM food
+                WHERE lower(description) LIKE ?
+                ORDER BY
+                    data_type_rank,
+                    length(description),
+                    description,
+                    fdc_id
+                LIMIT ?
+            ),
+            branded_matches AS (
+                SELECT
+                    fdc_id,
+                    any_value(brand_name) AS brand_name,
+                    any_value(brand_owner) AS brand_owner,
+                    any_value(household_serving_fulltext) AS household_serving_fulltext,
+                    any_value(serving_size) AS serving_size,
+                    any_value(serving_size_unit) AS serving_size_unit
+                FROM branded_food
+                WHERE fdc_id IN (SELECT fdc_id FROM matches)
+                GROUP BY fdc_id
+            )
             SELECT
-                fdc_id,
-                data_type,
-                description,
-                food_category_id
-            FROM food
-            WHERE lower(description) LIKE ?
+                f.fdc_id,
+                f.description,
+                f.data_type,
+                f.food_category_id,
+                fc.food_category,
+                b.brand_name,
+                b.brand_owner,
+                b.household_serving_fulltext,
+                b.serving_size,
+                b.serving_size_unit
+            FROM matches f
+            LEFT JOIN (
+                SELECT
+                    CAST(id AS VARCHAR) AS food_category_id,
+                    any_value(description) AS food_category
+                FROM food_category
+                GROUP BY id
+            ) fc
+                ON f.food_category_id = fc.food_category_id
+            LEFT JOIN branded_matches b
+                ON f.fdc_id = b.fdc_id
             ORDER BY
-                CASE data_type
-                    WHEN 'foundation_food' THEN 1
-                    WHEN 'sr_legacy_food' THEN 2
-                    WHEN 'survey_fndds_food' THEN 3
-                    WHEN 'branded_food' THEN 4
-                    ELSE 5
-                END,
-                length(description),
-                description
-            LIMIT ?
+                f.data_type_rank,
+                length(f.description),
+                f.description,
+                f.fdc_id
         """, [f"%{search_term.lower()}%", limit]).fetchdf()
 
     def get_nutrients(self, fdc_id):

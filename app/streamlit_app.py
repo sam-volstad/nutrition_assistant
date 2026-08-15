@@ -42,18 +42,101 @@ def format_portion(portion) -> str:
     return f"{description} — {amount_text}{unit} ({gram_text})"
 
 
+def available_text(value):
+    if pd.isna(value) or value == "":
+        return None
+    return str(value)
+
+
+def format_serving(food) -> str | None:
+    household_text = available_text(food.household_serving_fulltext)
+    serving_size = food.serving_size
+    serving_unit = available_text(food.serving_size_unit)
+
+    size_text = None
+    if pd.notna(serving_size):
+        size_text = f"{serving_size:g}"
+        if serving_unit:
+            size_text = f"{size_text} {serving_unit}"
+
+    if household_text and size_text:
+        return f"{household_text} ({size_text})"
+    return household_text or size_text
+
+
+def format_food_identity(food) -> str:
+    brand = available_text(food.brand_name) or available_text(food.brand_owner)
+    if brand:
+        return brand
+
+    type_labels = {
+        "foundation_food": "Generic",
+        "sr_legacy_food": "Generic",
+        "survey_fndds_food": "Survey food",
+        "branded_food": "Branded food",
+    }
+    return type_labels.get(food.data_type, food.data_type.replace("_", " ").title())
+
+
+def format_food_result(food) -> str:
+    parts = [food.description, format_food_identity(food)]
+    serving = format_serving(food)
+    if serving:
+        parts.append(serving)
+    return " | ".join(parts) + f" · FDC {food.fdc_id}"
+
+
+def food_details(food) -> dict:
+    details = {
+        "FDC ID": int(food.fdc_id),
+        "Description": food.description,
+        "Data type": food.data_type,
+    }
+    optional = {
+        "Food category": food.food_category,
+        "Brand name": food.brand_name,
+        "Brand owner": food.brand_owner,
+        "Household serving": food.household_serving_fulltext,
+        "Serving size": food.serving_size,
+        "Serving size unit": food.serving_size_unit,
+    }
+    details.update(
+        {
+            label: value
+            for label, value in optional.items()
+            if pd.notna(value) and value != ""
+        }
+    )
+    return details
+
+
 def score_display(engine, nutrients, targets):
     score = engine.score_against_targets(nutrients, targets)
     summary = engine.summarize_score(score).copy()
-    summary["target_progress"] = summary["target_progress"] * 100
+    summary["display_progress"] = (
+        summary["target_progress"]
+        .combine_first(summary["minimum_progress"])
+        .combine_first(summary["maximum_progress"])
+        * 100
+    )
+    status_labels = {
+        "unknown": "Unknown",
+        "low": "Low",
+        "approaching": "Approaching",
+        "acceptable": "Good",
+        "within_limit": "Within limit",
+        "over_max": "Over maximum",
+    }
+    summary["status"] = summary["status"].map(status_labels)
     return summary.rename(
         columns={
             "name": "Nutrient",
             "unit_name": "Unit",
             "amount_consumed": "Amount consumed",
+            "minimum_amount": "Minimum",
             "target_amount": "Target",
             "maximum_amount": "Maximum",
-            "target_progress": "Progress (%)",
+            "display_progress": "Progress (%)",
             "remaining_to_target": "Remaining",
             "status": "Status",
             "reported": "Reported",
@@ -63,6 +146,7 @@ def score_display(engine, nutrients, targets):
             "Nutrient",
             "Amount consumed",
             "Unit",
+            "Minimum",
             "Target",
             "Maximum",
             "Progress (%)",
@@ -71,6 +155,21 @@ def score_display(engine, nutrients, targets):
             "Reported",
         ]
     ]
+
+
+def style_score_display(score_table):
+    status_colors = {
+        "Good": "background-color: #d1e7dd; color: #0f5132",
+        "Within limit": "background-color: #d1e7dd; color: #0f5132",
+        "Approaching": "background-color: #fff3cd; color: #664d03",
+        "Low": "background-color: #ffe5b4; color: #663c00",
+        "Over maximum": "background-color: #f8d7da; color: #842029",
+        "Unknown": "background-color: #e9ecef; color: #495057",
+    }
+    return score_table.style.map(
+        lambda status: status_colors.get(status, ""),
+        subset=["Status"],
+    ).format(na_rep="—")
 
 
 def render_build_meal(food_repository, meal_repository, engine) -> None:
@@ -94,13 +193,7 @@ def render_build_meal(food_repository, meal_repository, engine) -> None:
         }
 
         def food_label(fdc_id):
-            row = results_by_fdc_id[fdc_id]
-            category = row.food_category_id
-            category_text = f"category {category}" if pd.notna(category) else "no category"
-            return (
-                f"{row.description} — {row.data_type}, "
-                f"{category_text}, FDC {row.fdc_id}"
-            )
+            return format_food_result(results_by_fdc_id[fdc_id])
 
         selected_fdc_id = st.selectbox(
             "Search results",
@@ -118,6 +211,12 @@ def render_build_meal(food_repository, meal_repository, engine) -> None:
             usable_portions = engine.get_usable_portions(fdc_id, portions=portions)
 
             st.subheader(selected_food.description)
+            st.markdown("**Food details**")
+            st.dataframe(
+                pd.DataFrame([food_details(selected_food)]),
+                hide_index=True,
+                width="stretch",
+            )
             if portions.empty:
                 st.info("No portion information is available. Enter grams directly.")
             else:
@@ -302,9 +401,9 @@ def render_saved_meals(meal_repository, target_repository, engine) -> None:
     st.subheader("Default target score")
     st.caption("Blank values mean the nutrient or limit is not reported/available, not zero.")
     st.dataframe(
-        score_display(engine, nutrients, targets),
+        style_score_display(score_display(engine, nutrients, targets)),
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
     )
 
     if st.button("Add meal to Today"):
@@ -352,9 +451,9 @@ def render_today(meal_repository, target_repository, engine) -> None:
     st.subheader("Default target score")
     st.caption("Blank values mean the nutrient or limit is not reported/available, not zero.")
     st.dataframe(
-        score_display(engine, day_nutrients, targets),
+        style_score_display(score_display(engine, day_nutrients, targets)),
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
     )
 
 

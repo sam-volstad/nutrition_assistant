@@ -175,15 +175,20 @@ class NutritionEngine:
             if pd.notna(row["maximum_amount"]) and row["amount_consumed"] > row["maximum_amount"]:
                 return "over_max"
 
-            if pd.notna(row["minimum_amount"]) and row["amount_consumed"] < row["minimum_amount"]:
-                return "below_minimum"
-
             if pd.notna(row["target_amount"]):
-                if row["amount_consumed"] < row["target_amount"]:
-                    return "below_target"
-                return "met"
+                progress = row["target_progress"]
+            elif pd.notna(row["minimum_amount"]):
+                progress = row["minimum_progress"]
+            elif pd.notna(row["maximum_amount"]):
+                return "within_limit"
+            else:
+                return "within_limit"
 
-            return "within_limit"
+            if progress < 0.80:
+                return "low"
+            if progress < 0.90:
+                return "approaching"
+            return "acceptable"
 
         scored["status"] = scored.apply(get_status, axis=1)
 
