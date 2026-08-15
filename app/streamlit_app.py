@@ -198,6 +198,7 @@ def score_display(engine, nutrients, targets):
     )
     status_labels = {
         "unknown": "? Unknown",
+        "partial": "◐ Partial data",
         "low": "↓ Low",
         "approaching": "△ Approaching",
         "acceptable": "✓ Good",
@@ -205,6 +206,12 @@ def score_display(engine, nutrients, targets):
         "over_max": "! Over maximum",
     }
     summary["status"] = summary["status"].map(status_labels)
+    coverage_labels = {
+        "complete": "✓ Complete",
+        "partial": "◐ Partial",
+        "unknown": "? Unknown",
+    }
+    summary["coverage_state"] = summary["coverage_state"].map(coverage_labels)
     return summary.rename(
         columns={
             "name": "Nutrient",
@@ -217,6 +224,7 @@ def score_display(engine, nutrients, targets):
             "remaining_to_target": "Remaining",
             "status": "Status",
             "reported": "Reported",
+            "coverage_state": "Coverage",
         }
     )[
         [
@@ -229,6 +237,7 @@ def score_display(engine, nutrients, targets):
             "Progress (%)",
             "Remaining",
             "Status",
+            "Coverage",
             "Reported",
         ]
     ]
@@ -242,6 +251,7 @@ def style_score_display(score_table):
         "↓ Low": "background-color: #ffe0b2; color: #5d3500",
         "! Over maximum": "background-color: #f4cccc; color: #6b1d16",
         "? Unknown": "background-color: #e9ecef; color: #343a40",
+        "◐ Partial data": "background-color: #e2e3e5; color: #343a40",
     }
     return score_table.style.map(
         lambda status: status_colors.get(status, ""),

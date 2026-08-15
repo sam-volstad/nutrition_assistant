@@ -109,22 +109,27 @@ class NutritionEngine:
 
         results = []
 
-        for ingredient in meal.ingredients:
+        for item_index, ingredient in enumerate(meal.ingredients):
             nutrients = self.calculate_food_nutrients(
                 ingredient.fdc_id,
                 ingredient.grams
             )
-
+            nutrients["_item_index"] = item_index
             results.append(nutrients)
 
-        meal_totals = (
-            pd.concat(results)
-            .groupby(
-                ["nutrient_id", "name", "unit_name"],
-                as_index=False
-            )["amount_consumed"]
-            .sum(min_count=1)
+        reported = pd.concat(results, ignore_index=True)
+        amounts = reported.groupby("nutrient_id", as_index=False).agg(
+            amount_consumed=("amount_consumed", lambda values: values.sum(min_count=1)),
+            contributing_items=("_item_index", "nunique"),
         )
+        meal_totals = self.food_repository.get_nutrient_catalog().merge(
+            amounts, on="nutrient_id", how="left"
+        )
+        meal_totals["contributing_items"] = (
+            meal_totals["contributing_items"].fillna(0).astype(int)
+        )
+        meal_totals["total_relevant_items"] = len(meal.ingredients)
+        meal_totals = self._add_coverage(meal_totals)
 
         return meal_totals
 
@@ -138,15 +143,29 @@ class NutritionEngine:
         )
 
     def score_against_targets(self, nutrients, targets):
+        coverage_columns = [
+            "contributing_items", "total_relevant_items",
+            "coverage_ratio", "coverage_state",
+        ]
+        available_coverage = [
+            column for column in coverage_columns if column in nutrients.columns
+        ]
         scored = targets.merge(
             nutrients[
-                ["nutrient_id", "amount_consumed"]
+                ["nutrient_id", "amount_consumed", *available_coverage]
             ],
             on="nutrient_id",
             how="left"
         )
 
         scored["reported"] = scored["amount_consumed"].notna()
+        if "coverage_state" not in scored:
+            scored["coverage_state"] = scored["reported"].map(
+                {True: "complete", False: "unknown"}
+            )
+            scored["coverage_ratio"] = scored["reported"].astype(float)
+            scored["contributing_items"] = scored["reported"].astype(int)
+            scored["total_relevant_items"] = 1
 
         scored["target_progress"] = (
             scored["amount_consumed"]
@@ -174,6 +193,9 @@ class NutritionEngine:
 
             if pd.notna(row["maximum_amount"]) and row["amount_consumed"] > row["maximum_amount"]:
                 return "over_max"
+
+            if row["coverage_state"] == "partial":
+                return "partial"
 
             if pd.notna(row["target_amount"]):
                 progress = row["target_progress"]
@@ -205,15 +227,36 @@ class NutritionEngine:
             results.append(meal_nutrients)
 
         day_totals = (
-            pd.concat(results)
-            .groupby(
-                ["nutrient_id", "name", "unit_name"],
-                as_index=False
-            )["amount_consumed"]
-            .sum(min_count=1)
+            pd.concat(results, ignore_index=True)
+            .groupby(["nutrient_id", "name", "unit_name"], as_index=False)
+            .agg(
+                amount_consumed=(
+                    "amount_consumed", lambda values: values.sum(min_count=1)
+                ),
+                contributing_items=("contributing_items", "sum"),
+                total_relevant_items=("total_relevant_items", "sum"),
+            )
         )
+        day_totals = self._add_coverage(day_totals)
 
         return day_totals
+
+    @staticmethod
+    def _add_coverage(nutrients):
+        nutrients["coverage_ratio"] = (
+            nutrients["contributing_items"]
+            / nutrients["total_relevant_items"]
+        )
+        nutrients["coverage_state"] = "partial"
+        nutrients.loc[
+            nutrients["contributing_items"] == 0, "coverage_state"
+        ] = "unknown"
+        nutrients.loc[
+            nutrients["contributing_items"]
+            == nutrients["total_relevant_items"],
+            "coverage_state",
+        ] = "complete"
+        return nutrients
 
 
     def summarize_score(self, score):
@@ -229,7 +272,11 @@ class NutritionEngine:
             "maximum_progress",
             "remaining_to_target",
             "status",
-            "reported"
+            "reported",
+            "contributing_items",
+            "total_relevant_items",
+            "coverage_ratio",
+            "coverage_state",
         ]
 
         return score[columns]

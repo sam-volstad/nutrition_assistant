@@ -93,6 +93,17 @@ class FoodRepository:
             ORDER BY n.rank
         """, [fdc_id]).fetchdf()
 
+    def get_nutrient_catalog(self):
+        """Return the nutrient universe used to represent unreported rows."""
+        return self.con.execute("""
+            SELECT DISTINCT
+                id AS nutrient_id,
+                name,
+                unit_name
+            FROM nutrient
+            ORDER BY nutrient_id
+        """).fetchdf()
+
     def get_portions(self, fdc_id):
         portions = self.con.execute("""
             SELECT

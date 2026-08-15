@@ -14,16 +14,41 @@ EXCLUDED_PREFERENCES = {"avoid", "never"}
 
 def score_candidate_meal(current_score, candidate_nutrients):
     """Score known benefits and upper-limit conflicts for one candidate meal."""
-    current = current_score[
+    current_source = current_score.copy()
+    if "coverage_state" not in current_source:
+        current_source["coverage_state"] = current_source["reported"].map(
+            {True: "complete", False: "unknown"}
+        )
+        current_source["coverage_ratio"] = current_source["reported"].astype(float)
+    current = current_source[
         [
             "nutrient_id", "name", "unit_name", "amount_consumed",
             "minimum_amount", "target_amount", "maximum_amount", "reported",
+            "coverage_ratio", "coverage_state",
         ]
-    ].rename(columns={"amount_consumed": "current_amount"})
-    candidate = candidate_nutrients[
-        ["nutrient_id", "amount_consumed"]
-    ].rename(columns={"amount_consumed": "candidate_amount"})
+    ].rename(columns={
+        "amount_consumed": "current_amount",
+        "coverage_ratio": "current_coverage_ratio",
+        "coverage_state": "current_coverage_state",
+    })
+    candidate_columns = ["nutrient_id", "amount_consumed"]
+    for column in ("coverage_ratio", "coverage_state"):
+        if column in candidate_nutrients:
+            candidate_columns.append(column)
+    candidate = candidate_nutrients[candidate_columns].rename(columns={
+        "amount_consumed": "candidate_amount",
+        "coverage_ratio": "candidate_coverage_ratio",
+        "coverage_state": "candidate_coverage_state",
+    })
     details = current.merge(candidate, on="nutrient_id", how="left")
+
+    if "candidate_coverage_state" not in details:
+        details["candidate_coverage_state"] = details["candidate_amount"].notna().map(
+            {True: "complete", False: "unknown"}
+        )
+        details["candidate_coverage_ratio"] = (
+            details["candidate_amount"].notna().astype(float)
+        )
 
     numeric_columns = [
         "current_amount", "minimum_amount", "target_amount",
@@ -59,27 +84,40 @@ def score_candidate_meal(current_score, candidate_nutrients):
     details.loc[benefit_mask, "benefit"] = (
         details.loc[benefit_mask, "gap_filled"]
         / details.loc[benefit_mask, "reference_amount"]
+        * details.loc[benefit_mask, "candidate_coverage_ratio"]
+    )
+    details["benefit_based_on_partial_data"] = (
+        (details["benefit"] > 0)
+        & (details["candidate_coverage_state"] == "partial")
     )
 
-    known_projection = details["reported"] & details["candidate_reported"]
+    complete_projection = (
+        (details["current_coverage_state"] == "complete")
+        & (details["candidate_coverage_state"] == "complete")
+    )
     details["projected_amount"] = float("nan")
-    details.loc[known_projection, "projected_amount"] = (
-        details.loc[known_projection, "current_amount"]
-        + details.loc[known_projection, "candidate_amount"]
+    details.loc[complete_projection, "projected_amount"] = (
+        details.loc[complete_projection, "current_amount"]
+        + details.loc[complete_projection, "candidate_amount"]
+    )
+    # This is a lower bound assembled only from reported values, not an
+    # assumption that unreported values are zero.
+    details["known_subtotal_after"] = (
+        details["current_amount"].fillna(0)
+        + details["candidate_amount"].fillna(0)
     )
     details["maximum_progress_after"] = (
         details["projected_amount"] / details["maximum_amount"]
     )
     details["upper_limit_excess"] = (
-        details["projected_amount"] - details["maximum_amount"]
+        details["known_subtotal_after"] - details["maximum_amount"]
     ).clip(lower=0)
     details["penalty"] = 0.0
 
     over_max_mask = (
-        known_projection
-        & details["maximum_amount"].notna()
+        details["maximum_amount"].notna()
         & (details["maximum_amount"] > 0)
-        & (details["projected_amount"] > details["maximum_amount"])
+        & (details["known_subtotal_after"] > details["maximum_amount"])
     )
     if over_max_mask.any():
         details.loc[over_max_mask, "penalty"] = UPPER_LIMIT_PENALTY * (
@@ -92,16 +130,24 @@ def score_candidate_meal(current_score, candidate_nutrients):
         "benefit", ascending=False
     )
     known_limit_warnings = details[
-        known_projection
-        & details["maximum_amount"].notna()
-        & (details["maximum_progress_after"] >= ACCEPTABLE_PROGRESS)
+        details["maximum_amount"].notna()
+        & (
+            (details["known_subtotal_after"] > details["maximum_amount"])
+            | (details["maximum_progress_after"] >= ACCEPTABLE_PROGRESS)
+            | ~complete_projection
+        )
     ].copy()
-    known_limit_warnings["limit_status"] = "approaching_max"
+    known_limit_warnings["limit_status"] = "uncertain_limit"
     known_limit_warnings.loc[
-        known_limit_warnings["projected_amount"]
+        known_limit_warnings["known_subtotal_after"]
         > known_limit_warnings["maximum_amount"],
         "limit_status",
     ] = "over_max"
+    known_limit_warnings.loc[
+        (known_limit_warnings["limit_status"] != "over_max")
+        & known_limit_warnings["maximum_progress_after"].ge(ACCEPTABLE_PROGRESS),
+        "limit_status",
+    ] = "approaching_max"
 
     benefit_score = float(details["benefit"].sum())
     penalty_score = float(details["penalty"].sum())
@@ -111,9 +157,12 @@ def score_candidate_meal(current_score, candidate_nutrients):
         "penalty_score": penalty_score,
         "nutrients_helped": int((details["benefit"] > 0).sum()),
         "major_nutrients_helped": helped["name"].head(3).tolist(),
+        "partial_benefit_nutrients": helped.loc[
+            helped["benefit_based_on_partial_data"], "name"
+        ].tolist(),
         "upper_limit_warnings": known_limit_warnings[
-            ["name", "unit_name", "projected_amount", "maximum_amount",
-             "limit_status", "penalty"]
+            ["name", "unit_name", "projected_amount", "known_subtotal_after",
+             "maximum_amount", "limit_status", "penalty"]
         ].to_dict("records"),
         "details": details,
     }
@@ -126,6 +175,9 @@ def recommendation_explanation(recommendation):
         if helped
         else "No currently known nutrient gaps helped"
     )
+    partial_help = recommendation.get("partial_benefit_nutrients", [])
+    if partial_help:
+        benefit_text += " (partial data: " + ", ".join(partial_help) + ")"
     if recommendation.get("preference") == "preferred":
         benefit_text = "Preferred meal • " + benefit_text
     elif recommendation.get("preference") == "acceptable":
@@ -139,6 +191,11 @@ def recommendation_explanation(recommendation):
         for warning in warnings:
             if warning["limit_status"] == "over_max":
                 warning_parts.append(f'{warning["name"]} would exceed its maximum')
+            elif warning["limit_status"] == "uncertain_limit":
+                warning_parts.append(
+                    f'{warning["name"]} upper-limit safety is uncertain '
+                    "because coverage is incomplete"
+                )
             else:
                 warning_parts.append(f'{warning["name"]} would approach its maximum')
         warning_text = "Caution: " + "; ".join(warning_parts)
