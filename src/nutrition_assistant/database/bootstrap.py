@@ -15,6 +15,34 @@ USDA_TABLES = (
     "branded_food",
 )
 
+# Current prototype baseline: adult DRI-based daily targets.
+# Tuple fields: nutrient_id, minimum, target, maximum, reference_type, notes.
+DEFAULT_NUTRIENT_TARGETS = (
+    (1008, None, 2576.0, None, "EER", None),
+    (1003, 49.0, 49.0, None, "RDA", None),
+    (1079, 36.0, 36.0, None, "AI", None),
+    (1087, 1000.0, 1000.0, 2500.0, "RDA/UL", None),
+    (1089, 8.0, 8.0, 45.0, "RDA/UL", None),
+    (
+        1090,
+        420.0,
+        420.0,
+        None,
+        "RDA",
+        "The supplemental magnesium UL does not apply to magnesium from food.",
+    ),
+    (1092, 3400.0, 3400.0, None, "AI", None),
+    (1093, None, 1500.0, 2300.0, "AI/UL", None),
+    (1095, 11.0, 11.0, 40.0, "RDA/UL", None),
+    (1106, 900.0, 900.0, 3000.0, "RDA/UL", None),
+    (1162, 90.0, 90.0, 2000.0, "RDA/UL", None),
+    (1114, 15.0, 15.0, 100.0, "RDA/UL", None),
+    (1109, 15.0, 15.0, 1000.0, "RDA/UL", None),
+    (1185, 120.0, 120.0, None, "AI", None),
+    (1177, 400.0, 400.0, 1000.0, "RDA/UL", None),
+    (1178, 2.4, 2.4, None, "RDA", None),
+)
+
 
 def initialize_database(
     database_path: str | Path = DATABASE_PATH,
@@ -196,4 +224,34 @@ def _create_application_schema(connection) -> None:
             WHERE profile_name = 'default'
         )
         """
+    )
+    _seed_default_targets(connection)
+
+
+def _seed_default_targets(connection) -> None:
+    connection.executemany(
+        """
+        INSERT OR IGNORE INTO nutrient_targets_v2 (
+            profile_id,
+            nutrient_id,
+            minimum_amount,
+            target_amount,
+            maximum_amount,
+            reference_type,
+            period,
+            notes
+        )
+        SELECT
+            profile_id,
+            ?,
+            ?,
+            ?,
+            ?,
+            ?,
+            'daily',
+            ?
+        FROM target_profiles
+        WHERE profile_name = 'default'
+        """,
+        DEFAULT_NUTRIENT_TARGETS,
     )
