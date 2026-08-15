@@ -1,3 +1,4 @@
+import math
 from pathlib import Path
 from threading import RLock
 
@@ -43,6 +44,7 @@ def initialize_session_state() -> None:
     st.session_state.setdefault("today_entries", [])
     st.session_state.setdefault("today_recommendation_vetoes", set())
     st.session_state.setdefault("today_food_recommendation_vetoes", set())
+    st.session_state.setdefault("recommendation_quantities", {})
     if not st.session_state.today_entries:
         st.session_state.today_food_recommendation_vetoes.clear()
     st.session_state.setdefault("editing_meal_id", None)
@@ -153,12 +155,30 @@ def format_recommendation_portion(recommendation) -> str:
     modifier = available_text(recommendation["modifier"])
     grams = recommendation["assumed_grams"]
     if modifier:
-        return f"Assumed serving: {modifier} ({grams:g} g)"
+        return f"Recommended: {modifier} ({grams:g} g)"
     amount = recommendation["portion_amount"]
     unit = available_text(recommendation["portion_unit"])
     if pd.notna(amount) and unit and unit.lower() not in {"g", "gram", "grams"}:
-        return f"Assumed serving: {amount:g} {unit} ({grams:g} g)"
-    return f"Assumed serving: {grams:g} g"
+        return f"Recommended: {amount:g} {unit} ({grams:g} g)"
+    return f"Recommended: {grams:g} g"
+
+
+def recommendation_logged_grams(assumed_grams, quantity) -> float:
+    """Resolve logged grams without changing the one-serving ranking basis."""
+    assumed_grams = float(assumed_grams)
+    quantity = float(quantity)
+    if not math.isfinite(quantity) or quantity <= 0:
+        raise ValueError("Quantity must be a positive finite number")
+    logged_grams = assumed_grams * quantity
+    if not math.isfinite(logged_grams) or logged_grams <= 0:
+        raise ValueError("Logged grams must be a positive finite number")
+    return logged_grams
+
+
+def remember_recommendation_quantity(fdc_id: int) -> None:
+    """Keep quantities stable when a card moves after rolling refill."""
+    key = f"recommendation_quantity_{fdc_id}"
+    st.session_state.recommendation_quantities[fdc_id] = st.session_state[key]
 
 
 def available_text(value):
@@ -339,22 +359,24 @@ def render_build_meal(food_repository, meal_repository, engine) -> None:
                 for row in results_by_fdc_id.values()
             ]
         )
-        selection = st.dataframe(
-            result_table,
-            hide_index=True,
-            width="stretch",
-            on_select="rerun",
-            selection_mode="single-row",
-            key=f"food_results_{search_term}",
-        )
-        selected_rows = selection.selection.rows
-        if selected_rows:
-            st.session_state.selected_food_fdc_id = int(
-                result_table.iloc[selected_rows[0]]["FDC ID"]
-            )
         selected_fdc_id = st.session_state.get("selected_food_fdc_id")
         if selected_fdc_id not in results_by_fdc_id:
             selected_fdc_id = None
+        st.caption("Food | Brand / identity | Serving | Food type | FDC ID")
+        for row in result_table.itertuples(index=False, name=None):
+            fdc_id = int(row[-1])
+            row_label = " | ".join(
+                str(value) if pd.notna(value) and value is not None else "—"
+                for value in row
+            )
+            if st.button(
+                row_label,
+                key=f"food_result_{fdc_id}",
+                type="primary" if selected_fdc_id == fdc_id else "secondary",
+                width="stretch",
+            ):
+                st.session_state.selected_food_fdc_id = fdc_id
+                st.rerun()
 
         if selected_fdc_id is not None:
             selected_food = results_by_fdc_id[selected_fdc_id]
@@ -890,38 +912,60 @@ def render_today(
             st.markdown(
                 f"**{rank}. {recommendation['description']}**{identity}"
             )
-            st.write(portion)
-            st.write(benefit_text)
+            serving_column, quantity_column, benefit_column = st.columns(
+                [1.5, 1, 2.5], vertical_alignment="bottom"
+            )
+            serving_column.write(portion)
+            quantity = quantity_column.number_input(
+                "Quantity",
+                min_value=0.01,
+                value=float(
+                    st.session_state.recommendation_quantities.get(
+                        recommendation["fdc_id"], 1.0
+                    )
+                ),
+                step=0.25,
+                key=f"recommendation_quantity_{recommendation['fdc_id']}",
+                on_change=remember_recommendation_quantity,
+                args=(recommendation["fdc_id"],),
+            )
+            try:
+                logged_grams = recommendation_logged_grams(
+                    recommendation["assumed_grams"], quantity
+                )
+            except ValueError:
+                logged_grams = None
+                quantity_column.error("Enter a positive finite quantity.")
+            else:
+                quantity_column.caption(f"Will add: {logged_grams:g} g")
+            benefit_column.write(benefit_text)
             if recommendation["upper_limit_warnings"]:
                 st.warning(f"⚠️ {warning_text}")
-            else:
-                st.write(f"✓ {warning_text}")
-            st.caption(
-                f"Score: {recommendation['score']:.3f} "
-                f"(nutrition {recommendation['nutrition_score']:.3f} + "
-                f"preference {recommendation['preference_bonus']:.2f}) · "
-                f"Assumed {recommendation['assumed_grams']:.1f} g"
-            )
-            add, not_today = st.columns(2)
             fdc_id = recommendation["fdc_id"]
+            add, not_today, preference_label, preferred, acceptable, avoid, never = (
+                st.columns([1.25, 1, 1.15, 1, 1, 0.8, 1.25])
+            )
             if add.button("Add to Today", key=f"add_food_{fdc_id}"):
-                st.session_state.today_entries.append({
-                    "kind": "temporary",
-                    "meal": Meal(
-                        name=recommendation["description"],
-                        ingredients=[Ingredient(
-                            fdc_id=fdc_id,
-                            grams=recommendation["assumed_grams"],
+                if logged_grams is None:
+                    st.error("Enter a positive finite quantity before adding.")
+                else:
+                    st.session_state.today_entries.append({
+                        "kind": "temporary",
+                        "meal": Meal(
                             name=recommendation["description"],
-                        )],
-                    ),
-                })
-                st.rerun()
+                            ingredients=[Ingredient(
+                                fdc_id=fdc_id,
+                                grams=logged_grams,
+                                name=recommendation["description"],
+                            )],
+                        ),
+                    })
+                    st.rerun()
             if not_today.button("Not today", key=f"veto_food_{fdc_id}"):
                 food_vetoes.add(fdc_id)
+                st.session_state.recommendation_quantities.pop(fdc_id, None)
                 st.rerun()
-            st.caption("Permanent preference")
-            preferred, acceptable, avoid, never = st.columns(4)
+            preference_label.caption("Permanent preference")
             actions = (
                 (preferred, "Preferred", "preferred"),
                 (acceptable, "Acceptable", "acceptable"),
@@ -932,6 +976,23 @@ def render_today(
                 if column.button(label, key=f"food_pref_{preference}_{fdc_id}"):
                     preference_repository.set_food_preference(fdc_id, preference)
                     st.rerun()
+            with st.expander("Details"):
+                st.write(warning_text)
+                st.caption(
+                    f"Final score: {recommendation['score']:.3f} | "
+                    f"Nutrition: {recommendation['nutrition_score']:.3f} | "
+                    f"Preference bonus: {recommendation['preference_bonus']:.2f} | "
+                    f"Ranking assumption: {recommendation['assumed_grams']:.1f} g"
+                )
+                contribution_details = pd.DataFrame(
+                    recommendation.get("explanation_nutrient_details", [])
+                )
+                if not contribution_details.empty:
+                    st.dataframe(
+                        contribution_details,
+                        hide_index=True,
+                        width="stretch",
+                    )
 
 
 def main() -> None:
