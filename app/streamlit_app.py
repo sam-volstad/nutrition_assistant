@@ -43,6 +43,20 @@ def initialize_session_state() -> None:
     deleted_meal_id = st.session_state.pop("pending_deleted_meal_id", None)
     if deleted_meal_id is not None:
         clear_deleted_meal_state(st.session_state, deleted_meal_id)
+    updated_meal_id = st.session_state.pop("pending_updated_meal_id", None)
+    if updated_meal_id is not None:
+        st.session_state.editing_meal_id = None
+        st.session_state.meal_ingredients = []
+        st.session_state.pop("builder_meal_name", None)
+        st.session_state.pop("builder_loaded_notice", None)
+        for key in list(st.session_state):
+            if str(key).startswith(f"builder_grams_{updated_meal_id}_"):
+                st.session_state.pop(key, None)
+        selection_key = (
+            "selected_saved_meal_"
+            f"{st.session_state.meal_library_selection_version}"
+        )
+        st.session_state[selection_key] = updated_meal_id
     pending = st.session_state.pop("pending_builder_meal", None)
     if pending is not None:
         st.session_state.meal_ingredients = pending["ingredients"]
@@ -475,9 +489,10 @@ def render_build_meal(food_repository, meal_repository, engine) -> None:
                     except ValueError as error:
                         st.error(str(error))
                     else:
-                        st.session_state.meal_ingredients = []
-                        st.session_state.editing_meal_id = None
-                        st.success("Meal Library entry updated.")
+                        st.session_state.pending_updated_meal_id = editing_meal_id
+                        st.session_state.active_page = "Meal Library"
+                        st.toast("Meal Library entry updated.")
+                        st.rerun()
             if cancel.button("Cancel editing"):
                 st.session_state.meal_ingredients = []
                 st.session_state.editing_meal_id = None

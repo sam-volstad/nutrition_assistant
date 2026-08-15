@@ -109,6 +109,13 @@ def score_candidate_meal(current_score, candidate_nutrients):
     details["maximum_progress_after"] = (
         details["projected_amount"] / details["maximum_amount"]
     )
+    details["known_maximum_progress_after"] = (
+        details["known_subtotal_after"] / details["maximum_amount"]
+    )
+    details["upper_limit_data_complete"] = complete_projection
+    details["upper_limit_uncertain"] = (
+        details["maximum_amount"].notna() & ~complete_projection
+    )
     details["upper_limit_excess"] = (
         details["known_subtotal_after"] - details["maximum_amount"]
     ).clip(lower=0)
@@ -133,8 +140,14 @@ def score_candidate_meal(current_score, candidate_nutrients):
         details["maximum_amount"].notna()
         & (
             (details["known_subtotal_after"] > details["maximum_amount"])
-            | (details["maximum_progress_after"] >= ACCEPTABLE_PROGRESS)
-            | ~complete_projection
+            | (
+                complete_projection
+                & (details["maximum_progress_after"] >= ACCEPTABLE_PROGRESS)
+            )
+            | (
+                ~complete_projection
+                & (details["known_maximum_progress_after"] >= 0.80)
+            )
         )
     ].copy()
     known_limit_warnings["limit_status"] = "uncertain_limit"
