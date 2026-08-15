@@ -30,7 +30,37 @@ def get_services(database_path: str):
 
 def initialize_session_state() -> None:
     st.session_state.setdefault("meal_ingredients", [])
-    st.session_state.setdefault("today_meal_ids", [])
+    st.session_state.setdefault("today_entries", [])
+    st.session_state.setdefault("editing_meal_id", None)
+    pending = st.session_state.pop("pending_builder_meal", None)
+    if pending is not None:
+        st.session_state.meal_ingredients = pending["ingredients"]
+        st.session_state.editing_meal_id = pending["meal_id"]
+        st.session_state.builder_meal_name = pending["name"]
+
+
+def meal_from_builder(name: str = "Custom meal") -> Meal:
+    return Meal(
+        name=name,
+        ingredients=[
+            Ingredient(
+                fdc_id=item["fdc_id"],
+                grams=item["grams"],
+                name=item["name"],
+            )
+            for item in st.session_state.meal_ingredients
+        ],
+    )
+
+
+def add_saved_meal_to_today(meal_id: int) -> bool:
+    if any(
+        entry["kind"] == "saved" and entry["meal_id"] == meal_id
+        for entry in st.session_state.today_entries
+    ):
+        return False
+    st.session_state.today_entries.append({"kind": "saved", "meal_id": meal_id})
+    return True
 
 
 def format_portion(portion) -> str:
@@ -124,12 +154,12 @@ def score_display(engine, nutrients, targets):
         * 100
     )
     status_labels = {
-        "unknown": "Unknown",
-        "low": "Low",
-        "approaching": "Approaching",
-        "acceptable": "Good",
-        "within_limit": "Within limit",
-        "over_max": "Over maximum",
+        "unknown": "? Unknown",
+        "low": "↓ Low",
+        "approaching": "△ Approaching",
+        "acceptable": "✓ Good",
+        "within_limit": "✓ Within limit",
+        "over_max": "! Over maximum",
     }
     summary["status"] = summary["status"].map(status_labels)
     return summary.rename(
@@ -163,12 +193,12 @@ def score_display(engine, nutrients, targets):
 
 def style_score_display(score_table):
     status_colors = {
-        "Good": "background-color: #d1e7dd; color: #0f5132",
-        "Within limit": "background-color: #d1e7dd; color: #0f5132",
-        "Approaching": "background-color: #fff3cd; color: #664d03",
-        "Low": "background-color: #ffe5b4; color: #663c00",
-        "Over maximum": "background-color: #f8d7da; color: #842029",
-        "Unknown": "background-color: #e9ecef; color: #495057",
+        "✓ Good": "background-color: #dbeafe; color: #1e3a5f",
+        "✓ Within limit": "background-color: #dbeafe; color: #1e3a5f",
+        "△ Approaching": "background-color: #fff3bf; color: #5f4800",
+        "↓ Low": "background-color: #ffe0b2; color: #5d3500",
+        "! Over maximum": "background-color: #f4cccc; color: #6b1d16",
+        "? Unknown": "background-color: #e9ecef; color: #343a40",
     }
     return score_table.style.map(
         lambda status: status_colors.get(status, ""),
@@ -178,8 +208,13 @@ def style_score_display(score_table):
 
 def render_build_meal(food_repository, meal_repository, engine) -> None:
     st.header("Build Meal")
+    if st.session_state.pop("builder_loaded_notice", False):
+        st.info("Library meal loaded for editing.")
     meal_name = st.text_input("Meal name", key="builder_meal_name")
     search_term = st.text_input("Search food", key="food_search").strip()
+    if st.session_state.get("last_food_search") != search_term:
+        st.session_state.last_food_search = search_term
+        st.session_state.selected_food_fdc_id = None
 
     if not search_term:
         st.info("Enter a food name to search.")
@@ -195,18 +230,34 @@ def render_build_meal(food_repository, meal_repository, engine) -> None:
             int(row.fdc_id): row
             for row in search_results.itertuples(index=False)
         }
-
-        def food_label(fdc_id):
-            return format_food_result(results_by_fdc_id[fdc_id])
-
-        selected_fdc_id = st.selectbox(
-            "Search results",
-            list(results_by_fdc_id),
-            format_func=food_label,
-            index=None,
-            placeholder="Select a food",
-            key="selected_food_fdc_id",
+        result_table = pd.DataFrame(
+            [
+                {
+                    "Food": row.description,
+                    "Brand / identity": format_food_identity(row),
+                    "Serving": format_serving(row),
+                    "Food type": row.data_type.replace("_", " ").title(),
+                    "FDC ID": int(row.fdc_id),
+                }
+                for row in results_by_fdc_id.values()
+            ]
         )
+        selection = st.dataframe(
+            result_table,
+            hide_index=True,
+            width="stretch",
+            on_select="rerun",
+            selection_mode="single-row",
+            key=f"food_results_{search_term}",
+        )
+        selected_rows = selection.selection.rows
+        if selected_rows:
+            st.session_state.selected_food_fdc_id = int(
+                result_table.iloc[selected_rows[0]]["FDC ID"]
+            )
+        selected_fdc_id = st.session_state.get("selected_food_fdc_id")
+        if selected_fdc_id not in results_by_fdc_id:
+            selected_fdc_id = None
 
         if selected_fdc_id is not None:
             selected_food = results_by_fdc_id[selected_fdc_id]
@@ -215,22 +266,23 @@ def render_build_meal(food_repository, meal_repository, engine) -> None:
             usable_portions = engine.get_usable_portions(fdc_id, portions=portions)
 
             st.subheader(selected_food.description)
-            st.markdown("**Food details**")
-            st.dataframe(
-                pd.DataFrame([food_details(selected_food)]),
-                hide_index=True,
-                width="stretch",
-            )
+            with st.expander("Food details"):
+                st.dataframe(
+                    pd.DataFrame([food_details(selected_food)]),
+                    hide_index=True,
+                    width="stretch",
+                )
             if portions.empty:
                 st.info("No portion information is available. Enter grams directly.")
             else:
-                st.dataframe(
-                    portions[
-                        ["amount", "modifier", "unit", "gram_weight", "source"]
-                    ],
-                    hide_index=True,
-                    use_container_width=True,
-                )
+                with st.expander("Available portion data"):
+                    st.dataframe(
+                        portions[
+                            ["amount", "modifier", "unit", "gram_weight", "source"]
+                        ],
+                        hide_index=True,
+                        width="stretch",
+                    )
 
             methods = ["Enter grams directly"]
             selectable_portions = (
@@ -255,16 +307,23 @@ def render_build_meal(food_repository, meal_repository, engine) -> None:
             quantity = 1.0
             if method == "Use a portion":
                 portion_indexes = usable_portions.index.tolist()
-                selected_portion_index = st.selectbox(
-                    "Portion",
-                    portion_indexes,
-                    format_func=lambda index: format_portion(
-                        usable_portions.loc[index]
-                    ),
-                    index=0 if len(portion_indexes) == 1 else None,
-                    placeholder="Choose a portion",
-                    key=f"portion_{fdc_id}",
-                )
+                if len(portion_indexes) == 1:
+                    selected_portion_index = portion_indexes[0]
+                    st.write(
+                        "Portion: "
+                        + format_portion(usable_portions.loc[selected_portion_index])
+                    )
+                else:
+                    selected_portion_index = st.selectbox(
+                        "Portion",
+                        portion_indexes,
+                        format_func=lambda index: format_portion(
+                            usable_portions.loc[index]
+                        ),
+                        index=None,
+                        placeholder="Choose a portion",
+                        key=f"portion_{fdc_id}",
+                    )
                 quantity = st.number_input(
                     "Quantity",
                     min_value=0.01,
@@ -327,41 +386,90 @@ def render_build_meal(food_repository, meal_repository, engine) -> None:
         st.info("No ingredients added yet.")
     else:
         for index, item in enumerate(ingredients):
-            description, remove = st.columns([5, 1])
-            description.write(f'{item["name"]} — {item["grams"]:.1f} g')
+            description, amount, remove = st.columns([4, 2, 1])
+            description.write(item["name"])
+            item["grams"] = amount.number_input(
+                "Grams",
+                min_value=0.01,
+                value=float(item["grams"]),
+                step=5.0,
+                key=(
+                    f'builder_grams_{st.session_state.editing_meal_id or "new"}_'
+                    f'{item["fdc_id"]}'
+                ),
+                label_visibility="collapsed",
+            )
             if remove.button("Remove", key=f"remove_ingredient_{index}"):
                 ingredients.pop(index)
                 st.rerun()
 
-        if st.button("Save meal"):
-            if not meal_name.strip():
-                st.error("Enter a meal name before saving.")
-            else:
-                meal = Meal(
-                    name=meal_name.strip(),
-                    ingredients=[
-                        Ingredient(
-                            fdc_id=item["fdc_id"],
-                            grams=item["grams"],
-                            name=item["name"],
-                        )
-                        for item in ingredients
-                    ],
-                )
-                try:
-                    meal_id = meal_repository.create_meal(meal)
-                except ValueError as error:
-                    st.error(str(error))
+        editing_meal_id = st.session_state.editing_meal_id
+        if editing_meal_id is not None:
+            update, cancel = st.columns(2)
+            if update.button("Update Meal Library", type="primary"):
+                if not meal_name.strip():
+                    st.error("Enter a meal name before updating.")
                 else:
-                    st.session_state.meal_ingredients = []
-                    st.success(f"Saved {meal.name} as meal {meal_id}.")
+                    try:
+                        meal_repository.update_meal(
+                            editing_meal_id,
+                            meal_from_builder(meal_name.strip()),
+                        )
+                    except ValueError as error:
+                        st.error(str(error))
+                    else:
+                        st.session_state.meal_ingredients = []
+                        st.session_state.editing_meal_id = None
+                        st.success("Meal Library entry updated.")
+            if cancel.button("Cancel editing"):
+                st.session_state.meal_ingredients = []
+                st.session_state.editing_meal_id = None
+                st.rerun()
+        else:
+            add_today, save_library, save_and_add = st.columns(3)
+            if add_today.button("Add to Today"):
+                st.session_state.today_entries.append(
+                    {"kind": "temporary", "meal": meal_from_builder()}
+                )
+                st.session_state.meal_ingredients = []
+                st.toast("Added Custom meal to Today without saving it.")
+                st.rerun()
+
+            if save_library.button("Save to Meal Library"):
+                if not meal_name.strip():
+                    st.error("Enter a meal name before saving to the Meal Library.")
+                else:
+                    try:
+                        meal_repository.create_meal(
+                            meal_from_builder(meal_name.strip())
+                        )
+                    except ValueError as error:
+                        st.error(str(error))
+                    else:
+                        st.session_state.meal_ingredients = []
+                        st.success(f"Saved {meal_name.strip()} to the Meal Library.")
+
+            if save_and_add.button("Save to Library & Add to Today"):
+                if not meal_name.strip():
+                    st.error("Enter a meal name before saving to the Meal Library.")
+                else:
+                    meal = meal_from_builder(meal_name.strip())
+                    try:
+                        meal_id = meal_repository.create_meal(meal)
+                    except ValueError as error:
+                        st.error(str(error))
+                    else:
+                        add_saved_meal_to_today(meal_id)
+                        st.session_state.meal_ingredients = []
+                        st.toast(f"Saved {meal.name} and added it to Today.")
+                        st.rerun()
 
 
 def render_saved_meals(meal_repository, target_repository, engine) -> None:
-    st.header("Saved Meals")
+    st.header("Meal Library")
     meals = meal_repository.list_meals()
     if meals.empty:
-        st.info("No saved meals yet.")
+        st.info("No meals in the library yet.")
         return
 
     meal_ids = [int(value) for value in meals["meal_id"]]
@@ -370,7 +478,7 @@ def render_saved_meals(meal_repository, target_repository, engine) -> None:
         for row in meals.itertuples()
     }
     selected_meal_id = st.selectbox(
-        "Saved meal",
+        "Library meal",
         meal_ids,
         format_func=labels.get,
         key="selected_saved_meal",
@@ -378,30 +486,75 @@ def render_saved_meals(meal_repository, target_repository, engine) -> None:
 
     try:
         meal = meal_repository.get_meal(selected_meal_id)
-        nutrients = engine.calculate_meal(meal)
-        targets = target_repository.get_profile("default")
     except ValueError as error:
         st.error(str(error))
         return
 
     st.subheader(meal.name)
     st.dataframe(
-        pd.DataFrame(
-            [
-                {
-                    "Food": ingredient.name,
-                    "FDC ID": ingredient.fdc_id,
-                    "Grams": ingredient.grams,
-                }
-                for ingredient in meal.ingredients
-            ]
-        ),
+        pd.DataFrame([
+            {"Food": ingredient.name, "FDC ID": ingredient.fdc_id,
+             "Grams": ingredient.grams}
+            for ingredient in meal.ingredients
+        ]),
         hide_index=True,
-        use_container_width=True,
+        width="stretch",
     )
 
+    add, edit, delete = st.columns(3)
+    if add.button("Add to Today", key="library_add_today"):
+        if add_saved_meal_to_today(selected_meal_id):
+            st.toast(f"Added {meal.name} to Today.")
+            st.rerun()
+        else:
+            st.warning("That saved meal is already in Today.")
+    if edit.button("Edit meal", key="library_edit"):
+        st.session_state.pending_builder_meal = {
+            "meal_id": selected_meal_id,
+            "name": meal.name,
+            "ingredients": [
+                {"fdc_id": ingredient.fdc_id, "name": ingredient.name,
+                 "grams": ingredient.grams}
+                for ingredient in meal.ingredients
+            ],
+        }
+        st.session_state.builder_loaded_notice = True
+        st.rerun()
+    if delete.button("Delete meal", key="library_delete"):
+        st.session_state.confirm_delete_meal_id = selected_meal_id
+
+    if st.session_state.get("confirm_delete_meal_id") == selected_meal_id:
+        st.warning(f'Permanently delete "{meal.name}" from the Meal Library?')
+        confirm, cancel = st.columns(2)
+        if confirm.button("Yes, delete", type="primary"):
+            try:
+                meal_repository.delete_meal(selected_meal_id)
+            except ValueError as error:
+                st.error(str(error))
+            else:
+                st.session_state.confirm_delete_meal_id = None
+                st.session_state.today_entries = [
+                    entry for entry in st.session_state.today_entries
+                    if not (
+                        entry["kind"] == "saved"
+                        and entry["meal_id"] == selected_meal_id
+                    )
+                ]
+                st.rerun()
+        if cancel.button("Cancel deletion"):
+            st.session_state.confirm_delete_meal_id = None
+            st.rerun()
+
+    try:
+        nutrients = engine.calculate_meal(meal)
+        targets = target_repository.get_profile("default")
+    except ValueError as error:
+        st.warning(f"Nutrient analysis is unavailable for this meal: {error}")
+        return
+
     st.subheader("Nutrient totals")
-    st.dataframe(nutrients, hide_index=True, use_container_width=True)
+    with st.expander("Raw nutrient totals"):
+        st.dataframe(nutrients, hide_index=True, width="stretch")
     st.subheader("Default target score")
     st.caption("Blank values mean the nutrient or limit is not reported/available, not zero.")
     st.dataframe(
@@ -410,34 +563,34 @@ def render_saved_meals(meal_repository, target_repository, engine) -> None:
         width="stretch",
     )
 
-    if st.button("Add meal to Today"):
-        if selected_meal_id in st.session_state.today_meal_ids:
-            st.warning("That meal is already in Today.")
-        else:
-            st.session_state.today_meal_ids.append(selected_meal_id)
-            st.success(f"Added {meal.name} to Today.")
-
-
 def render_today(meal_repository, target_repository, engine) -> None:
     st.header("Today")
-    meal_ids = st.session_state.today_meal_ids
-    if not meal_ids:
-        st.info("Add saved meals from the Saved Meals tab.")
+    entries = st.session_state.today_entries
+    if not entries:
+        st.info("Add a one-off meal from Meal Builder or a saved Meal Library entry.")
         return
 
     meals = []
-    for index, meal_id in enumerate(list(meal_ids)):
-        try:
-            meal = meal_repository.get_meal(meal_id)
-        except ValueError as error:
-            st.error(str(error))
-            continue
+    saved_meal_ids = []
+    for index, entry in enumerate(list(entries)):
+        if entry["kind"] == "saved":
+            meal_id = entry["meal_id"]
+            try:
+                meal = meal_repository.get_meal(meal_id)
+            except ValueError as error:
+                st.error(str(error))
+                continue
+            saved_meal_ids.append(meal_id)
+            label = f"{meal.name} · Meal Library"
+        else:
+            meal = entry["meal"]
+            label = f"{meal.name} · One-off"
 
         meals.append(meal)
         description, remove = st.columns([5, 1])
-        description.write(meal.name)
-        if remove.button("Remove", key=f"remove_today_{index}_{meal_id}"):
-            meal_ids.pop(index)
+        description.write(label)
+        if remove.button("Remove", key=f"remove_today_{index}"):
+            entries.pop(index)
             st.rerun()
 
     if not meals:
@@ -451,7 +604,8 @@ def render_today(meal_repository, target_repository, engine) -> None:
         return
 
     st.subheader("Day nutrient totals")
-    st.dataframe(day_nutrients, hide_index=True, use_container_width=True)
+    with st.expander("Raw day nutrient totals"):
+        st.dataframe(day_nutrients, hide_index=True, width="stretch")
     st.subheader("Default target score")
     st.caption("Blank values mean the nutrient or limit is not reported/available, not zero.")
     st.dataframe(
@@ -466,7 +620,7 @@ def render_today(meal_repository, target_repository, engine) -> None:
         "medical advice or a claim of an objectively optimal diet."
     )
     saved_meals = meal_repository.list_meals()
-    eligible_rows = saved_meals[~saved_meals["meal_id"].isin(meal_ids)]
+    eligible_rows = saved_meals[~saved_meals["meal_id"].isin(saved_meal_ids)]
     if eligible_rows.empty:
         st.info("No other saved meals are available to recommend.")
         return
@@ -476,8 +630,9 @@ def render_today(meal_repository, target_repository, engine) -> None:
     for row in eligible_rows.itertuples(index=False):
         try:
             candidate = meal_repository.get_meal(int(row.meal_id))
+            engine.calculate_meal(candidate)
         except ValueError as error:
-            st.warning(str(error))
+            st.warning(f'Skipped "{row.meal_name}": {error}')
             continue
         eligible_ids.append(int(row.meal_id))
         eligible_meals.append(candidate)
@@ -509,7 +664,7 @@ def render_today(meal_repository, target_repository, engine) -> None:
                 "Add to Today",
                 key=f"add_recommendation_{recommendation['meal_id']}",
             ):
-                st.session_state.today_meal_ids.append(recommendation["meal_id"])
+                add_saved_meal_to_today(recommendation["meal_id"])
                 st.rerun()
 
 
@@ -535,15 +690,15 @@ def main() -> None:
         st.stop()
 
     food_repository, meal_repository, target_repository, engine = services
-    build_tab, saved_tab, today_tab = st.tabs(
-        ["Build Meal", "Saved Meals", "Today"]
+    today_tab, build_tab, saved_tab = st.tabs(
+        ["Today", "Meal Builder", "Meal Library"]
     )
+    with today_tab:
+        render_today(meal_repository, target_repository, engine)
     with build_tab:
         render_build_meal(food_repository, meal_repository, engine)
     with saved_tab:
         render_saved_meals(meal_repository, target_repository, engine)
-    with today_tab:
-        render_today(meal_repository, target_repository, engine)
 
 if __name__ == "__main__":
     main()

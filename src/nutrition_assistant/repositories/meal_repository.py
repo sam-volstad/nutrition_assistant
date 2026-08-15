@@ -55,6 +55,56 @@ class MealRepository:
 
         return meal_id
 
+    def update_meal(self, meal_id: int, meal: Meal) -> None:
+        """Replace a saved meal atomically using the current prototype rules."""
+        if not meal.ingredients:
+            raise ValueError("Meal contains no ingredients")
+
+        fdc_ids = [ingredient.fdc_id for ingredient in meal.ingredients]
+        if len(fdc_ids) != len(set(fdc_ids)):
+            raise ValueError("Meal contains duplicate fdc_id values")
+
+        self.con.execute("BEGIN TRANSACTION")
+        try:
+            if self.con.execute(
+                "SELECT 1 FROM meals WHERE meal_id = ?", [meal_id]
+            ).fetchone() is None:
+                raise ValueError(f"Unknown meal_id: {meal_id}")
+
+            placeholders = ", ".join("?" for _ in fdc_ids)
+            existing_ids = {
+                row[0]
+                for row in self.con.execute(
+                    f"SELECT fdc_id FROM food WHERE fdc_id IN ({placeholders})",
+                    fdc_ids,
+                ).fetchall()
+            }
+            missing_ids = sorted(set(fdc_ids) - existing_ids)
+            if missing_ids:
+                raise ValueError(f"Unknown fdc_id values: {missing_ids}")
+
+            self.con.execute(
+                "UPDATE meals SET meal_name = ? WHERE meal_id = ?",
+                [meal.name, meal_id],
+            )
+            self.con.execute(
+                "DELETE FROM meal_ingredients WHERE meal_id = ?", [meal_id]
+            )
+            self.con.executemany(
+                """
+                INSERT INTO meal_ingredients (meal_id, fdc_id, grams)
+                VALUES (?, ?, ?)
+                """,
+                [
+                    (meal_id, ingredient.fdc_id, ingredient.grams)
+                    for ingredient in meal.ingredients
+                ],
+            )
+            self.con.execute("COMMIT")
+        except Exception:
+            self.con.execute("ROLLBACK")
+            raise
+
     def get_meal(self, meal_id: int) -> Meal:
         meal_row = self.con.execute(
             """
