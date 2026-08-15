@@ -88,32 +88,36 @@ def render_build_meal(food_repository, meal_repository, engine) -> None:
         st.warning("No foods matched that search.")
 
     if search_results is not None and not search_results.empty:
-        result_indexes = search_results.index.tolist()
+        results_by_fdc_id = {
+            int(row.fdc_id): row
+            for row in search_results.itertuples(index=False)
+        }
 
-        def food_label(index):
-            row = search_results.loc[index]
-            category = row["food_category_id"]
+        def food_label(fdc_id):
+            row = results_by_fdc_id[fdc_id]
+            category = row.food_category_id
             category_text = f"category {category}" if pd.notna(category) else "no category"
             return (
-                f'{row["description"]} — {row["data_type"]}, '
-                f'{category_text}, FDC {row["fdc_id"]}'
+                f"{row.description} — {row.data_type}, "
+                f"{category_text}, FDC {row.fdc_id}"
             )
 
-        selected_index = st.selectbox(
+        selected_fdc_id = st.selectbox(
             "Search results",
-            result_indexes,
+            list(results_by_fdc_id),
             format_func=food_label,
             index=None,
             placeholder="Select a food",
+            key="selected_food_fdc_id",
         )
 
-        if selected_index is not None:
-            selected_food = search_results.loc[selected_index]
-            fdc_id = int(selected_food["fdc_id"])
+        if selected_fdc_id is not None:
+            selected_food = results_by_fdc_id[selected_fdc_id]
+            fdc_id = int(selected_food.fdc_id)
             portions = food_repository.get_portions(fdc_id)
-            usable_portions = engine.get_usable_portions(fdc_id)
+            usable_portions = engine.get_usable_portions(fdc_id, portions=portions)
 
-            st.subheader(selected_food["description"])
+            st.subheader(selected_food.description)
             if portions.empty:
                 st.info("No portion information is available. Enter grams directly.")
             else:
@@ -200,7 +204,7 @@ def render_build_meal(food_repository, meal_repository, engine) -> None:
                         ingredient = Ingredient(
                             fdc_id=fdc_id,
                             grams=resolved_grams,
-                            name=selected_food["description"],
+                            name=selected_food.description,
                         )
                     except ValueError as error:
                         st.error(str(error))
@@ -386,4 +390,5 @@ def main() -> None:
     with today_tab:
         render_today(meal_repository, target_repository, engine)
 
-
+if __name__ == "__main__":
+    main()

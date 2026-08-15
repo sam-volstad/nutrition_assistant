@@ -40,8 +40,9 @@ class NutritionEngine:
             grams=grams
         )
 
-    def get_usable_portions(self, fdc_id):
-        portions = self.food_repository.get_portions(fdc_id)
+    def get_usable_portions(self, fdc_id, portions=None):
+        if portions is None:
+            portions = self.food_repository.get_portions(fdc_id)
         if portions.empty:
             return portions
 
