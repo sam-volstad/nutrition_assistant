@@ -48,6 +48,8 @@ def initialize_session_state() -> None:
     if not st.session_state.today_entries:
         st.session_state.today_food_recommendation_vetoes.clear()
     st.session_state.setdefault("editing_meal_id", None)
+    st.session_state.setdefault("builder_start_path", "new")
+    st.session_state.setdefault("builder_selected_saved_meal_id", None)
     st.session_state.setdefault("meal_library_selection_version", 0)
     st.session_state.setdefault(
         "active_page",
@@ -60,6 +62,7 @@ def initialize_session_state() -> None:
     if updated_meal_id is not None:
         st.session_state.editing_meal_id = None
         st.session_state.meal_ingredients = []
+        st.session_state.builder_start_path = "new"
         st.session_state.pop("builder_meal_name", None)
         st.session_state.pop("builder_loaded_notice", None)
         for key in list(st.session_state):
@@ -75,6 +78,17 @@ def initialize_session_state() -> None:
         st.session_state.meal_ingredients = pending["ingredients"]
         st.session_state.editing_meal_id = pending["meal_id"]
         st.session_state.builder_meal_name = pending["name"]
+        st.session_state.builder_start_path = "saved"
+    if st.session_state.pop("pending_builder_reset", False):
+        reset_builder_state(st.session_state)
+    created_meal_id = st.session_state.pop("pending_created_meal_id", None)
+    if created_meal_id is not None:
+        reset_builder_state(st.session_state)
+        selection_key = (
+            "selected_saved_meal_"
+            f"{st.session_state.meal_library_selection_version}"
+        )
+        st.session_state[selection_key] = created_meal_id
 
 
 def clear_deleted_meal_state(state, deleted_meal_id: int) -> None:
@@ -111,6 +125,37 @@ def clear_deleted_meal_state(state, deleted_meal_id: int) -> None:
         for key in list(state):
             if str(key).startswith(f"builder_grams_{deleted_meal_id}_"):
                 state.pop(key, None)
+
+
+def reset_builder_state(state) -> None:
+    """Clear only the current meal draft/editing state."""
+    state["meal_ingredients"] = []
+    state["editing_meal_id"] = None
+    state["builder_start_path"] = "new"
+    state.pop("builder_meal_name", None)
+    state.pop("builder_loaded_notice", None)
+    state.pop("pending_builder_meal", None)
+    for key in list(state):
+        if str(key).startswith("builder_grams_"):
+            state.pop(key, None)
+
+
+def queue_meal_for_builder(meal_id: int, meal: Meal) -> None:
+    """Load a saved recipe only after an explicit Edit action."""
+    st.session_state.pending_builder_meal = {
+        "meal_id": meal_id,
+        "name": meal.name,
+        "ingredients": [
+            {
+                "fdc_id": ingredient.fdc_id,
+                "name": ingredient.name,
+                "grams": ingredient.grams,
+            }
+            for ingredient in meal.ingredients
+        ],
+    }
+    st.session_state.builder_loaded_notice = True
+    st.session_state.active_page = "Meal Builder"
 
 
 def meal_from_builder(name: str = "Custom meal") -> Meal:
@@ -323,10 +368,103 @@ def style_score_display(score_table):
     ).format(na_rep="—")
 
 
-def render_build_meal(food_repository, meal_repository, engine) -> None:
+def render_build_meal(
+    food_repository, meal_repository, preference_repository, engine
+) -> None:
     st.header("Build Meal")
+    new_path, saved_path = st.columns(2)
+    if new_path.button(
+        "Build a new meal",
+        type=(
+            "primary"
+            if st.session_state.builder_start_path == "new"
+            else "secondary"
+        ),
+        width="stretch",
+    ):
+        st.session_state.pending_builder_reset = True
+        st.rerun()
+    if saved_path.button(
+        "Start from a saved meal",
+        type=(
+            "primary"
+            if st.session_state.builder_start_path == "saved"
+            else "secondary"
+        ),
+        width="stretch",
+    ):
+        st.session_state.builder_start_path = "saved"
+        st.rerun()
+
+    if (
+        st.session_state.builder_start_path == "saved"
+        and st.session_state.editing_meal_id is None
+    ):
+        saved_meals = meal_repository.list_meals()
+        if saved_meals.empty:
+            st.info("No saved meals are available yet.")
+        else:
+            live_ids = set(saved_meals["meal_id"].astype(int))
+            selected_saved_id = st.session_state.builder_selected_saved_meal_id
+            if selected_saved_id not in live_ids:
+                selected_saved_id = None
+                st.session_state.builder_selected_saved_meal_id = None
+            preferences = preference_repository.get_meal_preferences(live_ids)
+            st.caption("Saved meal | Ingredients | Recommendation preference")
+            for row in saved_meals.itertuples(index=False):
+                meal_id = int(row.meal_id)
+                preference = preferences.get(meal_id, "neutral").replace("_", " ")
+                label = (
+                    f"{row.meal_name} | {row.ingredient_count} ingredients | "
+                    f"{preference.title()}"
+                )
+                if st.button(
+                    label,
+                    key=f"builder_saved_meal_{meal_id}",
+                    type="primary" if selected_saved_id == meal_id else "secondary",
+                    width="stretch",
+                ):
+                    st.session_state.builder_selected_saved_meal_id = meal_id
+                    st.rerun()
+            selected_saved_id = st.session_state.builder_selected_saved_meal_id
+            if selected_saved_id in live_ids:
+                try:
+                    selected_saved_meal = meal_repository.get_meal(selected_saved_id)
+                except ValueError as error:
+                    st.error(str(error))
+                else:
+                    quick_add, edit_saved = st.columns(2)
+                    if quick_add.button(
+                        "Add saved meal to Today",
+                        key=f"builder_quick_add_{selected_saved_id}",
+                        width="stretch",
+                    ):
+                        if add_saved_meal_to_today(selected_saved_id):
+                            st.toast(f"Added {selected_saved_meal.name} to Today.")
+                            st.rerun()
+                        else:
+                            st.warning("That saved meal is already in Today.")
+                    if edit_saved.button(
+                        "Edit in Builder",
+                        key=f"builder_edit_saved_{selected_saved_id}",
+                        width="stretch",
+                    ):
+                        queue_meal_for_builder(
+                            selected_saved_id, selected_saved_meal
+                        )
+                        st.rerun()
+
     if st.session_state.pop("builder_loaded_notice", False):
         st.info("Library meal loaded for editing.")
+    if st.session_state.editing_meal_id is not None:
+        editing_name = st.session_state.get("builder_meal_name", "Saved meal")
+        st.info(
+            f'Editing Meal Library item: "{editing_name}". '
+            "Add to Today creates a one-off copy; "
+            "only Update Meal Library changes the saved recipe."
+        )
+    else:
+        st.caption("New meal")
     meal_name = st.text_input("Meal name", key="builder_meal_name")
     search_term = st.text_input("Search food", key="food_search").strip()
     if st.session_state.get("last_food_search") != search_term:
@@ -524,7 +662,18 @@ def render_build_meal(food_repository, meal_repository, engine) -> None:
 
         editing_meal_id = st.session_state.editing_meal_id
         if editing_meal_id is not None:
-            update, cancel = st.columns(2)
+            add_today, update, save_new, cancel = st.columns(4)
+            if add_today.button("Add to Today"):
+                one_off_name = meal_name.strip() or "Custom meal"
+                st.session_state.today_entries.append({
+                    "kind": "temporary",
+                    "meal": meal_from_builder(one_off_name),
+                })
+                st.toast(
+                    "Added the current customized meal to Today without "
+                    "changing the Meal Library."
+                )
+                st.rerun()
             if update.button("Update Meal Library", type="primary"):
                 if not meal_name.strip():
                     st.error("Enter a meal name before updating.")
@@ -541,18 +690,33 @@ def render_build_meal(food_repository, meal_repository, engine) -> None:
                         st.session_state.active_page = "Meal Library"
                         st.toast("Meal Library entry updated.")
                         st.rerun()
+            if save_new.button("Save as New Meal"):
+                if not meal_name.strip():
+                    st.error("Enter a meal name before saving a new meal.")
+                else:
+                    try:
+                        new_meal_id = meal_repository.create_meal(
+                            meal_from_builder(meal_name.strip())
+                        )
+                    except ValueError as error:
+                        st.error(str(error))
+                    else:
+                        st.session_state.pending_created_meal_id = new_meal_id
+                        st.session_state.active_page = "Meal Library"
+                        st.toast("Saved a separate Meal Library entry.")
+                        st.rerun()
             if cancel.button("Cancel editing"):
-                st.session_state.meal_ingredients = []
-                st.session_state.editing_meal_id = None
+                st.session_state.pending_builder_reset = True
                 st.rerun()
         else:
-            add_today, save_library, save_and_add = st.columns(3)
+            add_today, save_library, save_and_add, clear = st.columns(4)
             if add_today.button("Add to Today"):
+                one_off_name = meal_name.strip() or "Custom meal"
                 st.session_state.today_entries.append(
-                    {"kind": "temporary", "meal": meal_from_builder()}
+                    {"kind": "temporary", "meal": meal_from_builder(one_off_name)}
                 )
-                st.session_state.meal_ingredients = []
-                st.toast("Added Custom meal to Today without saving it.")
+                st.session_state.pending_builder_reset = True
+                st.toast(f"Added {one_off_name} to Today without saving it.")
                 st.rerun()
 
             if save_library.button("Save to Meal Library"):
@@ -566,8 +730,9 @@ def render_build_meal(food_repository, meal_repository, engine) -> None:
                     except ValueError as error:
                         st.error(str(error))
                     else:
-                        st.session_state.meal_ingredients = []
-                        st.success(f"Saved {meal_name.strip()} to the Meal Library.")
+                        st.session_state.pending_builder_reset = True
+                        st.toast(f"Saved {meal_name.strip()} to the Meal Library.")
+                        st.rerun()
 
             if save_and_add.button("Save to Library & Add to Today"):
                 if not meal_name.strip():
@@ -580,9 +745,12 @@ def render_build_meal(food_repository, meal_repository, engine) -> None:
                         st.error(str(error))
                     else:
                         add_saved_meal_to_today(meal_id)
-                        st.session_state.meal_ingredients = []
+                        st.session_state.pending_builder_reset = True
                         st.toast(f"Saved {meal.name} and added it to Today.")
                         st.rerun()
+            if clear.button("Clear meal"):
+                st.session_state.pending_builder_reset = True
+                st.rerun()
 
 
 def render_saved_meals(
@@ -672,17 +840,7 @@ def render_saved_meals(
         else:
             st.warning("That saved meal is already in Today.")
     if edit.button("Edit meal", key="library_edit"):
-        st.session_state.pending_builder_meal = {
-            "meal_id": selected_meal_id,
-            "name": meal.name,
-            "ingredients": [
-                {"fdc_id": ingredient.fdc_id, "name": ingredient.name,
-                 "grams": ingredient.grams}
-                for ingredient in meal.ingredients
-            ],
-        }
-        st.session_state.builder_loaded_notice = True
-        st.session_state.active_page = "Meal Builder"
+        queue_meal_for_builder(selected_meal_id, meal)
         st.rerun()
     if delete.button("Delete meal", key="library_delete"):
         st.session_state.confirm_delete_meal_id = selected_meal_id
@@ -1048,7 +1206,9 @@ def main() -> None:
                 engine,
             )
         elif st.session_state.active_page == "Meal Builder":
-            render_build_meal(food_repository, meal_repository, engine)
+            render_build_meal(
+                food_repository, meal_repository, preference_repository, engine
+            )
         else:
             render_saved_meals(
                 meal_repository, preference_repository, target_repository, engine
