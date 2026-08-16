@@ -145,6 +145,7 @@ def _create_application_schema(connection) -> None:
         "CREATE SEQUENCE IF NOT EXISTS meal_id_seq START 1",
         "CREATE SEQUENCE IF NOT EXISTS log_id_seq START 1",
         "CREATE SEQUENCE IF NOT EXISTS target_profile_id_seq START 1",
+        "CREATE SEQUENCE IF NOT EXISTS daily_entry_id_seq START 1",
         """
         CREATE TABLE IF NOT EXISTS food_preferences (
             fdc_id BIGINT PRIMARY KEY,
@@ -182,6 +183,28 @@ def _create_application_schema(connection) -> None:
             fdc_id BIGINT,
             grams DOUBLE,
             match_confidence DOUBLE
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS daily_entries (
+            entry_id BIGINT PRIMARY KEY DEFAULT nextval('daily_entry_id_seq'),
+            eaten_date DATE NOT NULL,
+            display_name VARCHAR NOT NULL,
+            source_type VARCHAR NOT NULL CHECK (
+                source_type IN ('saved_meal', 'one_off', 'recommended_food')
+            ),
+            source_meal_id BIGINT,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS daily_entry_ingredients (
+            entry_id BIGINT NOT NULL,
+            ingredient_order INTEGER NOT NULL CHECK (ingredient_order >= 0),
+            fdc_id BIGINT NOT NULL,
+            grams DOUBLE NOT NULL CHECK (grams > 0 AND isfinite(grams)),
+            display_name VARCHAR,
+            PRIMARY KEY (entry_id, ingredient_order)
         )
         """,
         """

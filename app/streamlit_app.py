@@ -1,4 +1,5 @@
 import math
+from datetime import date
 from pathlib import Path
 from threading import RLock
 
@@ -21,6 +22,7 @@ from nutrition_assistant.planner.optimizer import (
     select_food_recommendation_gaps,
 )
 from nutrition_assistant.repositories.food_repository import FoodRepository
+from nutrition_assistant.repositories.daily_log_repository import DailyLogRepository
 from nutrition_assistant.repositories.meal_repository import MealRepository
 from nutrition_assistant.repositories.preference_repository import PreferenceRepository
 from nutrition_assistant.repositories.target_repository import TargetRepository
@@ -35,25 +37,28 @@ def get_services(database_path: str):
         PreferenceRepository(food_repository.con),
         TargetRepository(food_repository.con),
         NutritionEngine(food_repository),
+        DailyLogRepository(food_repository.con),
         RLock(),
     )
 
 
-def initialize_session_state() -> None:
+def initialize_session_state(today_has_entries: bool = False) -> None:
     st.session_state.setdefault("meal_ingredients", [])
-    st.session_state.setdefault("today_entries", [])
     st.session_state.setdefault("today_recommendation_vetoes", set())
     st.session_state.setdefault("today_food_recommendation_vetoes", set())
     st.session_state.setdefault("recommendation_quantities", {})
-    if not st.session_state.today_entries:
+    local_date = date.today().isoformat()
+    if st.session_state.get("recommendation_veto_date") != local_date:
+        st.session_state.today_recommendation_vetoes.clear()
         st.session_state.today_food_recommendation_vetoes.clear()
+        st.session_state.recommendation_veto_date = local_date
     st.session_state.setdefault("editing_meal_id", None)
     st.session_state.setdefault("builder_start_path", "new")
     st.session_state.setdefault("builder_selected_saved_meal_id", None)
     st.session_state.setdefault("meal_library_selection_version", 0)
     st.session_state.setdefault(
         "active_page",
-        "Today" if st.session_state.today_entries else "Meal Builder",
+        "Today" if today_has_entries else "Meal Builder",
     )
     deleted_meal_id = st.session_state.pop("pending_deleted_meal_id", None)
     if deleted_meal_id is not None:
@@ -93,14 +98,6 @@ def initialize_session_state() -> None:
 
 def clear_deleted_meal_state(state, deleted_meal_id: int) -> None:
     """Remove only session references tied to a successfully deleted meal."""
-    state["today_entries"] = [
-        entry
-        for entry in state.get("today_entries", [])
-        if not (
-            entry["kind"] == "saved"
-            and entry["meal_id"] == deleted_meal_id
-        )
-    ]
     state.get("today_recommendation_vetoes", set()).discard(deleted_meal_id)
 
     selection_version = state.get("meal_library_selection_version", 0)
@@ -172,13 +169,22 @@ def meal_from_builder(name: str = "Custom meal") -> Meal:
     )
 
 
-def add_saved_meal_to_today(meal_id: int) -> bool:
+def add_saved_meal_to_today(
+    daily_log_repository, meal_repository, meal_id: int
+) -> bool:
+    today = date.today()
     if any(
-        entry["kind"] == "saved" and entry["meal_id"] == meal_id
-        for entry in st.session_state.today_entries
+        entry.source_meal_id == meal_id
+        for entry in daily_log_repository.get_entries(today)
     ):
         return False
-    st.session_state.today_entries.append({"kind": "saved", "meal_id": meal_id})
+    meal = meal_repository.get_meal(meal_id)
+    daily_log_repository.add_entry(
+        today,
+        meal,
+        source_meal_id=meal_id,
+        source_type="saved_meal",
+    )
     return True
 
 
@@ -369,7 +375,11 @@ def style_score_display(score_table):
 
 
 def render_build_meal(
-    food_repository, meal_repository, preference_repository, engine
+    food_repository,
+    meal_repository,
+    preference_repository,
+    daily_log_repository,
+    engine,
 ) -> None:
     st.header("Build Meal")
     new_path, saved_path = st.columns(2)
@@ -439,7 +449,11 @@ def render_build_meal(
                         key=f"builder_quick_add_{selected_saved_id}",
                         width="stretch",
                     ):
-                        if add_saved_meal_to_today(selected_saved_id):
+                        if add_saved_meal_to_today(
+                            daily_log_repository,
+                            meal_repository,
+                            selected_saved_id,
+                        ):
                             st.toast(f"Added {selected_saved_meal.name} to Today.")
                             st.rerun()
                         else:
@@ -665,10 +679,12 @@ def render_build_meal(
             add_today, update, save_new, cancel = st.columns(4)
             if add_today.button("Add to Today"):
                 one_off_name = meal_name.strip() or "Custom meal"
-                st.session_state.today_entries.append({
-                    "kind": "temporary",
-                    "meal": meal_from_builder(one_off_name),
-                })
+                daily_log_repository.add_entry(
+                    date.today(),
+                    meal_from_builder(one_off_name),
+                    source_meal_id=editing_meal_id,
+                    source_type="one_off",
+                )
                 st.toast(
                     "Added the current customized meal to Today without "
                     "changing the Meal Library."
@@ -712,8 +728,8 @@ def render_build_meal(
             add_today, save_library, save_and_add, clear = st.columns(4)
             if add_today.button("Add to Today"):
                 one_off_name = meal_name.strip() or "Custom meal"
-                st.session_state.today_entries.append(
-                    {"kind": "temporary", "meal": meal_from_builder(one_off_name)}
+                daily_log_repository.add_entry(
+                    date.today(), meal_from_builder(one_off_name)
                 )
                 st.session_state.pending_builder_reset = True
                 st.toast(f"Added {one_off_name} to Today without saving it.")
@@ -744,7 +760,9 @@ def render_build_meal(
                     except ValueError as error:
                         st.error(str(error))
                     else:
-                        add_saved_meal_to_today(meal_id)
+                        add_saved_meal_to_today(
+                            daily_log_repository, meal_repository, meal_id
+                        )
                         st.session_state.pending_builder_reset = True
                         st.toast(f"Saved {meal.name} and added it to Today.")
                         st.rerun()
@@ -754,7 +772,11 @@ def render_build_meal(
 
 
 def render_saved_meals(
-    meal_repository, preference_repository, target_repository, engine
+    meal_repository,
+    preference_repository,
+    target_repository,
+    daily_log_repository,
+    engine,
 ) -> None:
     st.header("Meal Library")
     meals = meal_repository.list_meals()
@@ -834,7 +856,9 @@ def render_saved_meals(
 
     add, edit, delete = st.columns(3)
     if add.button("Add to Today", key="library_add_today"):
-        if add_saved_meal_to_today(selected_meal_id):
+        if add_saved_meal_to_today(
+            daily_log_repository, meal_repository, selected_meal_id
+        ):
             st.toast(f"Added {meal.name} to Today.")
             st.rerun()
         else:
@@ -883,10 +907,12 @@ def render_today(
     meal_repository,
     preference_repository,
     target_repository,
+    daily_log_repository,
     engine,
 ) -> None:
     st.header("Today")
-    entries = st.session_state.today_entries
+    today = date.today()
+    entries = daily_log_repository.get_entries(today)
     vetoes = st.session_state.today_recommendation_vetoes
     if vetoes and st.button("Clear today's Not today choices"):
         vetoes.clear()
@@ -900,42 +926,30 @@ def render_today(
     saved_meals = meal_repository.list_meals()
     live_meal_ids = set(saved_meals["meal_id"].astype(int).tolist())
     vetoes.intersection_update(live_meal_ids)
-    entries[:] = [
-        entry
+    meals = [entry.meal for entry in entries]
+    saved_meal_ids = [
+        entry.source_meal_id
         for entry in entries
-        if entry["kind"] != "saved" or int(entry["meal_id"]) in live_meal_ids
+        if entry.source_meal_id is not None
     ]
-    if not entries:
-        st.info("No current Today entries remain.")
-        return
-
-    meals = []
-    saved_meal_ids = []
     today_fdc_ids = set()
-    for index, entry in enumerate(list(entries)):
-        if entry["kind"] == "saved":
-            meal_id = entry["meal_id"]
-            try:
-                meal = meal_repository.get_meal(meal_id)
-            except ValueError as error:
-                st.error(str(error))
-                continue
-            saved_meal_ids.append(meal_id)
-            label = f"{meal.name} · Meal Library"
-        else:
-            meal = entry["meal"]
-            label = f"{meal.name} · One-off"
-
-        meals.append(meal)
+    source_labels = {
+        "saved_meal": "Meal Library snapshot",
+        "one_off": "One-off",
+        "recommended_food": "Food recommendation",
+    }
+    for entry in entries:
+        meal = entry.meal
+        label = f"{entry.display_name} · {source_labels[entry.source_type]}"
         today_fdc_ids.update(
             ingredient.fdc_id for ingredient in meal.ingredients
         )
         description, remove = st.columns([5, 1])
         description.write(label)
-        if remove.button("Remove", key=f"remove_today_{index}"):
-            entries.pop(index)
-            if not entries:
-                st.session_state.today_food_recommendation_vetoes.clear()
+        if remove.button(
+            "Remove from Today", key=f"remove_today_{entry.entry_id}"
+        ):
+            daily_log_repository.delete_entry(entry.entry_id)
             st.rerun()
 
     if not meals:
@@ -1024,8 +1038,14 @@ def render_today(
             if add.button(
                 "Add to Today", key=f"add_recommendation_{recommendation['meal_id']}"
             ):
-                add_saved_meal_to_today(recommendation["meal_id"])
-                st.rerun()
+                if add_saved_meal_to_today(
+                    daily_log_repository,
+                    meal_repository,
+                    recommendation["meal_id"],
+                ):
+                    st.rerun()
+                else:
+                    st.warning("That saved meal is already in Today.")
             if not_today.button(
                 "Not today", key=f"veto_recommendation_{recommendation['meal_id']}"
             ):
@@ -1107,9 +1127,9 @@ def render_today(
                 if logged_grams is None:
                     st.error("Enter a positive finite quantity before adding.")
                 else:
-                    st.session_state.today_entries.append({
-                        "kind": "temporary",
-                        "meal": Meal(
+                    daily_log_repository.add_entry(
+                        today,
+                        Meal(
                             name=recommendation["description"],
                             ingredients=[Ingredient(
                                 fdc_id=fdc_id,
@@ -1117,7 +1137,8 @@ def render_today(
                                 name=recommendation["description"],
                             )],
                         ),
-                    })
+                        source_type="recommended_food",
+                    )
                     st.rerun()
             if not_today.button("Not today", key=f"veto_food_{fdc_id}"):
                 food_vetoes.add(fdc_id)
@@ -1153,10 +1174,64 @@ def render_today(
                     )
 
 
+def render_history(daily_log_repository, target_repository, engine) -> None:
+    st.header("History")
+    available_dates = daily_log_repository.get_available_dates()
+    if not available_dates:
+        st.info("No daily history has been recorded yet.")
+        return
+
+    selected_date = st.selectbox(
+        "Day",
+        available_dates,
+        format_func=lambda value: value.strftime("%A, %B %d, %Y"),
+    )
+    entries = daily_log_repository.get_entries(selected_date)
+    source_labels = {
+        "saved_meal": "Meal Library snapshot",
+        "one_off": "One-off",
+        "recommended_food": "Food recommendation",
+    }
+    st.subheader("Logged meals and foods")
+    for entry in entries:
+        with st.expander(
+            f"{entry.display_name} · {source_labels[entry.source_type]}"
+        ):
+            st.dataframe(
+                pd.DataFrame([
+                    {
+                        "Food": ingredient.name,
+                        "FDC ID": ingredient.fdc_id,
+                        "Grams": ingredient.grams,
+                    }
+                    for ingredient in entry.meal.ingredients
+                ]),
+                hide_index=True,
+                width="stretch",
+            )
+
+    try:
+        day_nutrients = engine.calculate_day([entry.meal for entry in entries])
+        targets = target_repository.get_profile("default")
+    except ValueError as error:
+        st.warning(f"Nutrient analysis is unavailable for this day: {error}")
+        return
+
+    st.subheader("Day nutrient totals")
+    with st.expander("Raw day nutrient totals"):
+        st.dataframe(day_nutrients, hide_index=True, width="stretch")
+    st.subheader("Default target score")
+    st.caption("Blank values mean not reported/available, not zero.")
+    st.dataframe(
+        style_score_display(score_display(engine, day_nutrients, targets)),
+        hide_index=True,
+        width="stretch",
+    )
+
+
 def main() -> None:
     st.set_page_config(page_title="Nutrition Assistant", layout="wide")
     st.title("Nutrition Assistant")
-    initialize_session_state()
 
     if not DATABASE_PATH.is_file():
         st.error(
@@ -1180,9 +1255,14 @@ def main() -> None:
         preference_repository,
         target_repository,
         engine,
+        daily_log_repository,
         database_lock,
     ) = services
-    pages = ("Today", "Meal Builder", "Meal Library")
+    with database_lock:
+        today_has_entries = bool(daily_log_repository.get_entries(date.today()))
+    initialize_session_state(today_has_entries)
+
+    pages = ("Today", "Meal Builder", "Meal Library", "History")
     navigation = st.columns(len(pages))
     for column, page in zip(navigation, pages):
         if column.button(
@@ -1203,16 +1283,27 @@ def main() -> None:
                 meal_repository,
                 preference_repository,
                 target_repository,
+                daily_log_repository,
                 engine,
             )
         elif st.session_state.active_page == "Meal Builder":
             render_build_meal(
-                food_repository, meal_repository, preference_repository, engine
+                food_repository,
+                meal_repository,
+                preference_repository,
+                daily_log_repository,
+                engine,
+            )
+        elif st.session_state.active_page == "Meal Library":
+            render_saved_meals(
+                meal_repository,
+                preference_repository,
+                target_repository,
+                daily_log_repository,
+                engine,
             )
         else:
-            render_saved_meals(
-                meal_repository, preference_repository, target_repository, engine
-            )
+            render_history(daily_log_repository, target_repository, engine)
 
 if __name__ == "__main__":
     main()
